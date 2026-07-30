@@ -344,6 +344,70 @@ app.put('/api/pricing/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// ================= BUYER CHECKOUT (public, no login required) =================
+
+// Buyer: place an order for a product. Called by the Flutter app's "Buy Now" button.
+// No authentication needed — buyers don't have accounts (by design). Buyer contact
+// details are captured directly on the order.
+app.post('/api/checkout', async (req, res) => {
+  try {
+    const { productId, size, quantity, buyerName, buyerMobile, shippingAddress, shippingPincode } = req.body;
+
+    if (!productId || !size || !buyerName || !buyerMobile || !shippingAddress) {
+      return res.status(400).json({
+        error: 'productId, size, buyerName, buyerMobile, and shippingAddress are required',
+      });
+    }
+
+    const qty = Number(quantity) > 0 ? Number(quantity) : 1;
+
+    const product = await Product.findById(productId);
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+    if (product.status !== 'live') return res.status(400).json({ error: 'This product is not currently available' });
+
+    const sizeEntry = product.sizeStock.find(s => s.size === size);
+    if (!sizeEntry) return res.status(400).json({ error: `Size ${size} is not available for this product` });
+    if (sizeEntry.stock < qty) {
+      return res.status(400).json({ error: `Only ${sizeEntry.stock} left in size ${size}` });
+    }
+
+    // Deduct stock atomically-ish: re-check and save. Fine for this scale; for high
+    // concurrency this should use a Mongo transaction or findOneAndUpdate with a
+    // stock >= qty filter.
+    sizeEntry.stock -= qty;
+    product.stock = product.sizeStock.reduce((sum, s) => sum + Number(s.stock || 0), 0);
+    await product.save();
+
+    const order = await Order.create({
+      supplierId: product.supplierId,
+      items: [{
+        productId: product._id,
+        title: product.title,
+        imageUrl: product.imageUrl,
+        size,
+        quantity: qty,
+        price: product.price,
+      }],
+      totalAmount: product.price * qty,
+      buyerName,
+      buyerMobile,
+      shippingAddress,
+      shippingPincode: shippingPincode || '',
+      status: 'pending',
+      paymentStatus: 'pending',
+    });
+
+    res.json({
+      success: true,
+      orderId: order._id.toString(),
+      message: 'Order placed successfully',
+    });
+  } catch (err) {
+    console.error('Checkout error:', err);
+    res.status(500).json({ error: 'Failed to place order' });
+  }
+});
+
 // ================= ORDERS =================
 
 function safeOrder(orderDoc) {
