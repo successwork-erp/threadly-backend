@@ -5,6 +5,8 @@ const path = require('path');
 const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const Razorpay = require('razorpay');
 const { connectDB } = require('./mongo');
 const Supplier = require('./models/Supplier');
 const Product = require('./models/Product');
@@ -14,6 +16,12 @@ const InstantCashRequest = require('./models/InstantCashRequest');
 const app = express();
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || 'demo-secret-change-in-production';
+
+// Razorpay client — only initializes if keys are set. Payment routes check this
+// and return a clear error rather than crashing the whole server if keys are missing.
+const razorpay = (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET)
+  ? new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET })
+  : null;
 
 app.use(cors());
 app.use(express.json());
@@ -405,6 +413,130 @@ app.post('/api/checkout', async (req, res) => {
   } catch (err) {
     console.error('Checkout error:', err);
     res.status(500).json({ error: 'Failed to place order' });
+  }
+});
+
+// ================= RAZORPAY PAYMENTS (test mode) =================
+
+// Buyer: create a Razorpay payment order for an existing Threadly order.
+// Called after checkout, when the buyer chooses "Pay Online" instead of COD.
+app.post('/api/payments/create-order', async (req, res) => {
+  try {
+    if (!razorpay) {
+      return res.status(503).json({ error: 'Online payments are not configured yet. Please choose Cash on Delivery.' });
+    }
+
+    const { orderId } = req.body;
+    if (!orderId) return res.status(400).json({ error: 'orderId is required' });
+
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.paymentStatus === 'paid') return res.status(400).json({ error: 'This order is already paid' });
+
+    // Razorpay amount is in paise (smallest currency unit), and needs a short receipt id
+    const razorpayOrder = await razorpay.orders.create({
+      amount: Math.round(order.totalAmount * 100),
+      currency: 'INR',
+      receipt: order._id.toString(),
+      notes: { threadlyOrderId: order._id.toString() },
+    });
+
+    res.json({
+      razorpayOrderId: razorpayOrder.id,
+      amount: razorpayOrder.amount,
+      currency: razorpayOrder.currency,
+      keyId: process.env.RAZORPAY_KEY_ID,
+    });
+  } catch (err) {
+    console.error('Razorpay create-order error:', err);
+    res.status(500).json({ error: 'Failed to start payment. Please try again.' });
+  }
+});
+
+// Buyer: verify payment after Razorpay's checkout completes.
+// This is the security-critical step — never trust a "payment succeeded" claim
+// from the app itself; always verify Razorpay's signature server-side first.
+app.post('/api/payments/verify', async (req, res) => {
+  try {
+    if (!razorpay) {
+      return res.status(503).json({ error: 'Online payments are not configured yet.' });
+    }
+
+    const { orderId, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    if (!orderId || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ error: 'Missing payment verification details' });
+    }
+
+    const expectedSignature = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest('hex');
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ error: 'Payment verification failed. This payment could not be confirmed as genuine.' });
+    }
+
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    order.paymentStatus = 'paid';
+    order.paidAt = new Date();
+    await order.save();
+
+    res.json({ success: true, message: 'Payment verified and order marked as paid' });
+  } catch (err) {
+    console.error('Razorpay verify error:', err);
+    res.status(500).json({ error: 'Failed to verify payment' });
+  }
+});
+
+// Buyer: track an order by its ID (no login — the order ID itself is the receipt/tracking code)
+app.get('/api/track/:orderId', async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found. Check your order ID and try again.' });
+
+    res.json({
+      orderId: order._id.toString(),
+      status: order.status,
+      items: order.items,
+      totalAmount: order.totalAmount,
+      buyerName: order.buyerName,
+      shippingAddress: order.shippingAddress,
+      shippingPincode: order.shippingPincode,
+      paymentStatus: order.paymentStatus,
+      orderDate: order.orderDate,
+      returnStatus: order.returnStatus,
+    });
+  } catch (err) {
+    // Invalid ObjectId format also lands here
+    res.status(404).json({ error: 'Order not found. Check your order ID and try again.' });
+  }
+});
+
+// Buyer: get a printable invoice for an order by its ID (no login needed, same as tracking)
+app.get('/api/invoice/:orderId', async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const supplier = await Supplier.findById(order.supplierId);
+
+    res.json({
+      orderId: order._id.toString(),
+      orderDate: order.orderDate,
+      items: order.items,
+      totalAmount: order.totalAmount,
+      buyerName: order.buyerName,
+      buyerMobile: order.buyerMobile,
+      shippingAddress: order.shippingAddress,
+      shippingPincode: order.shippingPincode,
+      paymentStatus: order.paymentStatus,
+      sellerName: supplier?.businessName || supplier?.name || 'Threadly Seller',
+      sellerGst: order.items?.[0]?.gst || '',
+    });
+  } catch (err) {
+    res.status(404).json({ error: 'Order not found' });
   }
 });
 
