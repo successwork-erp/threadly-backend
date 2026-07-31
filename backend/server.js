@@ -7,12 +7,15 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const Razorpay = require('razorpay');
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const { connectDB } = require('./mongo');
 const Supplier = require('./models/Supplier');
 const Buyer = require('./models/Buyer');
 const Product = require('./models/Product');
 const Order = require('./models/Order');
 const InstantCashRequest = require('./models/InstantCashRequest');
+const Review = require('./models/Review');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -27,19 +30,39 @@ const razorpay = (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET
 app.use(cors());
 app.use(express.json());
 
-// ---- File uploads (product images) ----
-// NOTE: Render's free tier wipes local disk on every restart/redeploy, so uploaded
-// images will still be lost even though supplier/product DATA is now safe in MongoDB.
-// Fine for a demo. Before going to real suppliers, move this to Cloudinary/S3 (see README Part 5).
+// ---- File uploads (product images + review media) ----
+// Stored on Cloudinary (free tier) instead of local disk — Render's local disk is
+// wiped on every restart/redeploy, which was silently deleting product photos and
+// review media while the URLs still pointed at the now-missing files. Cloudinary
+// URLs are permanent regardless of backend redeploys.
+const cloudinaryConfigured = !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
+if (cloudinaryConfigured) {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
+} else {
+  console.error('Cloudinary env vars are not set (CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET). Image uploads will fail until these are added in Render → Environment.');
+}
+
+// Old local-disk uploads (from before this change) are still served here, in case
+// any already-saved records still point at a relative /uploads/... path.
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 app.use('/uploads', express.static(uploadDir));
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => cb(null, Date.now() + '-' + Math.round(Math.random() * 1e9) + path.extname(file.originalname)),
+const cloudinaryStorage = new CloudinaryStorage({
+  cloudinary,
+  params: {
+    folder: 'threadly',
+    resource_type: 'auto', // auto-detects image vs video, needed for review media
+    allowed_formats: ['jpg', 'jpeg', 'png', 'webp', 'mp4', 'mov', 'webm'],
+  },
 });
-const upload = multer({ storage });
+const upload = multer({ storage: cloudinaryStorage });
+// Review media can include short video clips, so cap size a bit higher than a typical photo.
+const uploadReviewMedia = multer({ storage: cloudinaryStorage, limits: { fileSize: 25 * 1024 * 1024 } }); // 25MB per file
 
 // ---- Auth middleware ----
 function authMiddleware(req, res, next) {
@@ -295,7 +318,7 @@ app.post('/api/products', authMiddleware, upload.array('images', 6), async (req,
 
     const splitList = (v) => (v ? v.split(',').map(s => s.trim()).filter(Boolean) : []);
 
-    const imageUrls = (req.files && req.files.length > 0) ? req.files.map(f => '/uploads/' + f.filename) : [];
+    const imageUrls = (req.files && req.files.length > 0) ? req.files.map(f => f.path) : [];
 
     const product = await Product.create({
       supplierId: req.supplierId,
@@ -393,7 +416,7 @@ app.post('/api/products/:id/images', authMiddleware, upload.array('images', 6), 
     if (!product) return res.status(404).json({ error: 'Product not found' });
     if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No images provided' });
 
-    const newUrls = req.files.map(f => '/uploads/' + f.filename);
+    const newUrls = req.files.map(f => f.path);
     product.imageUrls = [...(product.imageUrls || []), ...newUrls].slice(0, 6);
     if (!product.imageUrl && product.imageUrls.length > 0) product.imageUrl = product.imageUrls[0];
 
@@ -744,6 +767,35 @@ app.post('/api/orders/:id/label', authMiddleware, async (req, res) => {
 
 // ================= RETURNS =================
 
+// Buyer: request a return on a delivered order (no login — same order-ID pattern as tracking/invoice)
+app.post('/api/returns/request', async (req, res) => {
+  try {
+    const { orderId, reason } = req.body;
+    if (!orderId) return res.status(400).json({ error: 'orderId is required' });
+    if (!reason || !reason.trim()) return res.status(400).json({ error: 'A reason for the return is required' });
+
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found. Check your order ID and try again.' });
+
+    if (order.status !== 'delivered') {
+      return res.status(400).json({ error: 'Returns can only be requested for orders that have been delivered.' });
+    }
+    if (order.returnStatus !== 'none') {
+      return res.status(400).json({ error: `A return has already been ${order.returnStatus} for this order.` });
+    }
+
+    order.returnRequested = true;
+    order.returnReason = reason.trim();
+    order.returnStatus = 'requested';
+    await order.save();
+
+    res.json({ success: true, message: 'Return request submitted. The seller will review it shortly.', returnStatus: order.returnStatus });
+  } catch (err) {
+    console.error('Return request error:', err);
+    res.status(404).json({ error: 'Order not found. Check your order ID and try again.' });
+  }
+});
+
 // Supplier: list orders with a return requested
 app.get('/api/returns', authMiddleware, async (req, res) => {
   try {
@@ -802,6 +854,74 @@ app.put('/api/claims/:id', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('Update claim error:', err);
     res.status(500).json({ error: 'Failed to update claim' });
+  }
+});
+
+// ================= REVIEWS =================
+
+// Buyer: submit a review with star rating + optional photos/videos (no login needed —
+// eligibility is proven by owning a delivered order, same order-ID pattern as returns/tracking)
+app.post('/api/reviews', uploadReviewMedia.array('media', 4), async (req, res) => {
+  try {
+    const { orderId, rating, comment } = req.body;
+    if (!orderId) return res.status(400).json({ error: 'orderId is required' });
+
+    const ratingNum = Number(rating);
+    if (!ratingNum || ratingNum < 1 || ratingNum > 5) {
+      return res.status(400).json({ error: 'rating must be a number from 1 to 5' });
+    }
+
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found. Check your order ID and try again.' });
+
+    if (order.status !== 'delivered') {
+      return res.status(400).json({ error: 'You can only review a product after your order has been delivered.' });
+    }
+
+    const existing = await Review.findOne({ orderId: order._id });
+    if (existing) return res.status(409).json({ error: 'You have already reviewed this order.' });
+
+    const mediaUrls = (req.files && req.files.length > 0) ? req.files.map((f) => f.path) : [];
+
+    const review = await Review.create({
+      productId: order.items[0].productId,
+      orderId: order._id,
+      buyerName: order.buyerName,
+      buyerId: order.buyerId || null,
+      rating: ratingNum,
+      comment: comment ? comment.trim() : '',
+      mediaUrls,
+    });
+
+    res.json({ success: true, review: { ...review.toObject(), id: review._id.toString() } });
+  } catch (err) {
+    if (err.code === 11000) return res.status(409).json({ error: 'You have already reviewed this order.' });
+    console.error('Submit review error:', err);
+    res.status(500).json({ error: 'Failed to submit review' });
+  }
+});
+
+// Public: list reviews for a product (shown on the product page in the app/web)
+app.get('/api/products/:id/reviews', async (req, res) => {
+  try {
+    const reviews = await Review.find({ productId: req.params.id }).sort({ createdAt: -1 });
+    const summary = reviews.length
+      ? { count: reviews.length, average: Math.round((reviews.reduce((s, r) => s + r.rating, 0) / reviews.length) * 10) / 10 }
+      : { count: 0, average: 0 };
+    res.json({
+      summary,
+      reviews: reviews.map((r) => ({
+        id: r._id.toString(),
+        buyerName: r.buyerName,
+        rating: r.rating,
+        comment: r.comment,
+        mediaUrls: r.mediaUrls,
+        createdAt: r.createdAt,
+      })),
+    });
+  } catch (err) {
+    console.error('List reviews error:', err);
+    res.status(500).json({ error: 'Failed to load reviews' });
   }
 });
 
