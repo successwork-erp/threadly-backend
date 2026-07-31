@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const Razorpay = require('razorpay');
 const { connectDB } = require('./mongo');
 const Supplier = require('./models/Supplier');
+const Buyer = require('./models/Buyer');
 const Product = require('./models/Product');
 const Order = require('./models/Order');
 const InstantCashRequest = require('./models/InstantCashRequest');
@@ -58,6 +59,27 @@ function safeSupplier(supplierDoc) {
   const s = supplierDoc.toObject ? supplierDoc.toObject() : supplierDoc;
   const { password, securityAnswer, __v, ...rest } = s;
   return { ...rest, id: s._id.toString() };
+}
+
+// ---- Buyer auth middleware (separate from supplier auth above) ----
+function buyerAuthMiddleware(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header) return res.status(401).json({ error: 'No token provided' });
+  const token = header.replace('Bearer ', '');
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.type !== 'buyer') return res.status(401).json({ error: 'Invalid token type' });
+    req.buyerId = decoded.id;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+function safeBuyer(buyerDoc) {
+  const b = buyerDoc.toObject ? buyerDoc.toObject() : buyerDoc;
+  const { password, __v, ...rest } = b;
+  return { ...rest, id: b._id.toString() };
 }
 
 function safeProduct(productDoc, supplierName) {
@@ -126,6 +148,107 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('Me error:', err);
     res.status(500).json({ error: 'Failed to load profile' });
+  }
+});
+
+// ================= BUYER AUTH =================
+
+// Buyer: register a new account
+app.post('/api/buyer/register', async (req, res) => {
+  try {
+    const { name, email, mobile, password } = req.body;
+    if (!name || !email || !mobile || !password) {
+      return res.status(400).json({ error: 'Name, email, mobile and password are required' });
+    }
+
+    const exists = await Buyer.findOne({ $or: [{ email }, { mobile }] });
+    if (exists) return res.status(409).json({ error: 'An account with this email or mobile already exists' });
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const buyer = await Buyer.create({ name, email, mobile, password: hashedPassword });
+
+    const token = jwt.sign({ id: buyer._id.toString(), type: 'buyer' }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, buyer: safeBuyer(buyer) });
+  } catch (err) {
+    console.error('Buyer register error:', err);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// Buyer: log in
+app.post('/api/buyer/login', async (req, res) => {
+  try {
+    const { emailOrMobile, password } = req.body;
+    if (!emailOrMobile || !password) {
+      return res.status(400).json({ error: 'Email/mobile and password are required' });
+    }
+
+    const buyer = await Buyer.findOne({ $or: [{ email: emailOrMobile }, { mobile: emailOrMobile }] });
+    if (!buyer) return res.status(404).json({ error: 'No account found with this email/mobile' });
+
+    const match = await bcrypt.compare(password, buyer.password);
+    if (!match) return res.status(401).json({ error: 'Incorrect password' });
+
+    const token = jwt.sign({ id: buyer._id.toString(), type: 'buyer' }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, buyer: safeBuyer(buyer) });
+  } catch (err) {
+    console.error('Buyer login error:', err);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Buyer: get own profile (confirms/restores session on app open)
+app.get('/api/buyer/me', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const buyer = await Buyer.findById(req.buyerId);
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+    res.json(safeBuyer(buyer));
+  } catch (err) {
+    console.error('Buyer me error:', err);
+    res.status(500).json({ error: 'Failed to load profile' });
+  }
+});
+
+// Buyer: view own order history (this is the actual feature buyer accounts unlock —
+// a real "My Orders" list, instead of needing to save each Order ID separately)
+app.get('/api/buyer/orders', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const orders = await Order.find({ buyerId: req.buyerId }).sort({ createdAt: -1 });
+    res.json(orders.map(o => {
+      const obj = o.toObject();
+      const { __v, _id, supplierId, buyerId, ...rest } = obj;
+      return { ...rest, id: _id.toString() };
+    }));
+  } catch (err) {
+    console.error('Buyer orders error:', err);
+    res.status(500).json({ error: 'Failed to load orders' });
+  }
+});
+
+// Buyer: manage saved delivery addresses
+app.get('/api/buyer/addresses', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const buyer = await Buyer.findById(req.buyerId);
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+    res.json(buyer.addresses);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load addresses' });
+  }
+});
+
+app.post('/api/buyer/addresses', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const { label, address, pincode } = req.body;
+    if (!address) return res.status(400).json({ error: 'address is required' });
+
+    const buyer = await Buyer.findById(req.buyerId);
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+
+    buyer.addresses.push({ label: label || 'Home', address, pincode: pincode || '' });
+    await buyer.save();
+    res.json(buyer.addresses);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to add address' });
   }
 });
 
@@ -367,6 +490,19 @@ app.post('/api/checkout', async (req, res) => {
       });
     }
 
+    // If the buyer is logged in, link this order to their account so it shows up
+    // in their order history. Checkout works fine without this too (guest checkout).
+    let buyerId = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader) {
+      try {
+        const decoded = jwt.verify(authHeader.replace('Bearer ', ''), JWT_SECRET);
+        if (decoded.type === 'buyer') buyerId = decoded.id;
+      } catch (e) {
+        // Invalid/expired token on checkout — proceed as guest rather than failing the order
+      }
+    }
+
     const qty = Number(quantity) > 0 ? Number(quantity) : 1;
 
     const product = await Product.findById(productId);
@@ -388,6 +524,7 @@ app.post('/api/checkout', async (req, res) => {
 
     const order = await Order.create({
       supplierId: product.supplierId,
+      buyerId,
       items: [{
         productId: product._id,
         title: product.title,
