@@ -11,6 +11,7 @@ const orderItemSchema = new mongoose.Schema({
 
 const orderSchema = new mongoose.Schema({
   supplierId: { type: mongoose.Schema.Types.ObjectId, ref: 'Supplier', required: true },
+  buyerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Buyer', default: null }, // null for guest checkout
 
   items: { type: [orderItemSchema], required: true },
   totalAmount: { type: Number, required: true },
