@@ -188,10 +188,14 @@ app.post('/api/buyer/register', async (req, res) => {
     if (exists) return res.status(409).json({ error: 'An account with this email or mobile already exists' });
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    const buyer = await Buyer.create({ name, email, mobile, password: hashedPassword });
+    const buyer = await Buyer.create({ name, email, mobile, password: hashedPassword, approvalStatus: 'pending' });
 
-    const token = jwt.sign({ id: buyer._id.toString(), type: 'buyer' }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token, buyer: safeBuyer(buyer) });
+    // No token here — buyers cannot log in until a supplier approves them on the web portal.
+    res.json({
+      success: true,
+      message: 'Registration submitted. Your account will be reviewed and you can log in once approved.',
+      approvalStatus: buyer.approvalStatus,
+    });
   } catch (err) {
     console.error('Buyer register error:', err);
     res.status(500).json({ error: 'Registration failed' });
@@ -211,6 +215,13 @@ app.post('/api/buyer/login', async (req, res) => {
 
     const match = await bcrypt.compare(password, buyer.password);
     if (!match) return res.status(401).json({ error: 'Incorrect password' });
+
+    if (buyer.approvalStatus === 'pending') {
+      return res.status(403).json({ error: 'Your account is awaiting approval from the seller. Please check back later.', approvalStatus: 'pending' });
+    }
+    if (buyer.approvalStatus === 'rejected') {
+      return res.status(403).json({ error: 'Your account registration was not approved.', approvalStatus: 'rejected' });
+    }
 
     const token = jwt.sign({ id: buyer._id.toString(), type: 'buyer' }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ token, buyer: safeBuyer(buyer) });
@@ -922,6 +933,42 @@ app.get('/api/products/:id/reviews', async (req, res) => {
   } catch (err) {
     console.error('List reviews error:', err);
     res.status(500).json({ error: 'Failed to load reviews' });
+  }
+});
+
+// ================= BUYER APPROVALS =================
+
+// Supplier: list buyers awaiting approval (any logged-in supplier can see/act on these)
+app.get('/api/buyer-approvals', authMiddleware, async (req, res) => {
+  try {
+    const status = req.query.status || 'pending'; // pending | approved | rejected | all
+    const filter = status === 'all' ? {} : { approvalStatus: status };
+    const buyers = await Buyer.find(filter).sort({ createdAt: -1 });
+    res.json(buyers.map(safeBuyer));
+  } catch (err) {
+    console.error('List buyer approvals error:', err);
+    res.status(500).json({ error: 'Failed to load buyer approvals' });
+  }
+});
+
+// Supplier: approve or reject a buyer's registration
+app.put('/api/buyer-approvals/:id', authMiddleware, async (req, res) => {
+  try {
+    const { action } = req.body; // 'approve' or 'reject'
+    if (!['approve', 'reject'].includes(action)) {
+      return res.status(400).json({ error: "action must be 'approve' or 'reject'" });
+    }
+
+    const buyer = await Buyer.findById(req.params.id);
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+
+    buyer.approvalStatus = action === 'approve' ? 'approved' : 'rejected';
+    await buyer.save();
+
+    res.json({ success: true, buyer: safeBuyer(buyer) });
+  } catch (err) {
+    console.error('Buyer approval action error:', err);
+    res.status(500).json({ error: 'Failed to update buyer approval status' });
   }
 });
 
