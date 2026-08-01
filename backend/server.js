@@ -18,6 +18,7 @@ const InstantCashRequest = require('./models/InstantCashRequest');
 const Review = require('./models/Review');
 const Party = require('./models/Party');
 const PurchaseBill = require('./models/PurchaseBill');
+const Catalog = require('./models/Catalog');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -133,6 +134,14 @@ app.post('/api/auth/register', async (req, res) => {
       securityQuestion: securityQuestion || null,
       securityAnswer: securityAnswer || null,
     });
+
+    // Seed default catalogs so the supplier has something to assign right away —
+    // they can rename or add more later from the catalog dropdown.
+    await Catalog.insertMany([
+      { supplierId: supplier._id, name: 'Catalog 1' },
+      { supplierId: supplier._id, name: 'Catalog 2' },
+      { supplierId: supplier._id, name: 'Catalog 3' },
+    ]);
 
     const token = jwt.sign({ id: supplier._id.toString() }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, supplier: safeSupplier(supplier) });
@@ -293,7 +302,33 @@ app.post('/api/buyer/addresses', buyerAuthMiddleware, async (req, res) => {
 // Public: list all products (this is what the mobile app polls)
 app.get('/api/products', async (req, res) => {
   try {
-    const products = await Product.find().sort({ createdAt: -1 });
+    // If a logged-in buyer is calling this, only show products in catalogs they've
+    // been granted access to. Guests (no token) and buyers with no catalog
+    // restrictions see everything — this filter only narrows, never blocks by default.
+    let buyerCatalogIds = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader) {
+      try {
+        const decoded = jwt.verify(authHeader.replace('Bearer ', ''), JWT_SECRET);
+        if (decoded.type === 'buyer') {
+          const buyer = await Buyer.findById(decoded.id);
+          if (buyer && buyer.catalogIds && buyer.catalogIds.length > 0) {
+            buyerCatalogIds = buyer.catalogIds.map((id) => id.toString());
+          }
+        }
+      } catch (e) {
+        // Invalid/expired token — fall through and show unfiltered results as a guest would see
+      }
+    }
+
+    let products = await Product.find().sort({ createdAt: -1 });
+
+    if (buyerCatalogIds) {
+      products = products.filter((p) =>
+        p.catalogIds.some((cid) => buyerCatalogIds.includes(cid.toString()))
+      );
+    }
+
     const supplierIds = [...new Set(products.map(p => p.supplierId.toString()))];
     const suppliers = await Supplier.find({ _id: { $in: supplierIds } });
     const nameById = Object.fromEntries(suppliers.map(s => [s._id.toString(), s.businessName || s.name]));
@@ -327,6 +362,16 @@ app.post('/api/products', authMiddleware, upload.array('images', 6), async (req,
       parsedSizeStock = b.sizeStock ? JSON.parse(b.sizeStock) : [];
     } catch (e) {
       parsedSizeStock = [];
+    }
+
+    let parsedCatalogIds = [];
+    try {
+      parsedCatalogIds = b.catalogIds ? JSON.parse(b.catalogIds) : [];
+    } catch (e) {
+      parsedCatalogIds = [];
+    }
+    if (parsedCatalogIds.length === 0) {
+      return res.status(400).json({ error: 'At least one catalog is required' });
     }
 
     const splitList = (v) => (v ? v.split(',').map(s => s.trim()).filter(Boolean) : []);
@@ -376,6 +421,7 @@ app.post('/api/products', authMiddleware, upload.array('images', 6), async (req,
       imageUrls,
       imageUrl: imageUrls.length > 0 ? imageUrls[0] : null,
       status: 'live',
+      catalogIds: parsedCatalogIds,
     });
 
     res.json(safeProduct(product));
@@ -412,6 +458,9 @@ app.put('/api/products/:id', authMiddleware, async (req, res) => {
     if (b.sizeStock !== undefined) {
       product.sizeStock = Array.isArray(b.sizeStock) ? b.sizeStock : JSON.parse(b.sizeStock);
       product.stock = product.sizeStock.reduce((sum, s) => sum + Number(s.stock || 0), 0);
+    }
+    if (b.catalogIds !== undefined) {
+      product.catalogIds = Array.isArray(b.catalogIds) ? b.catalogIds : JSON.parse(b.catalogIds);
     }
 
     await product.save();
@@ -1058,10 +1107,11 @@ app.get('/api/buyer-approvals', authMiddleware, async (req, res) => {
   }
 });
 
-// Supplier: approve or reject a buyer's registration
+// Supplier: approve or reject a buyer's registration.
+// When approving, pass catalogIds — the list of catalogs this buyer is granted access to.
 app.put('/api/buyer-approvals/:id', authMiddleware, async (req, res) => {
   try {
-    const { action } = req.body; // 'approve' or 'reject'
+    const { action, catalogIds } = req.body; // 'approve' or 'reject'
     if (!['approve', 'reject'].includes(action)) {
       return res.status(400).json({ error: "action must be 'approve' or 'reject'" });
     }
@@ -1070,12 +1120,53 @@ app.put('/api/buyer-approvals/:id', authMiddleware, async (req, res) => {
     if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
 
     buyer.approvalStatus = action === 'approve' ? 'approved' : 'rejected';
+    if (action === 'approve') {
+      buyer.catalogIds = Array.isArray(catalogIds) ? catalogIds : [];
+    }
     await buyer.save();
 
     res.json({ success: true, buyer: safeBuyer(buyer) });
   } catch (err) {
     console.error('Buyer approval action error:', err);
     res.status(500).json({ error: 'Failed to update buyer approval status' });
+  }
+});
+
+// ================= CATALOGS =================
+// Named product groupings a supplier creates, used to control which buyers see which products.
+
+app.get('/api/catalogs', authMiddleware, async (req, res) => {
+  try {
+    let catalogs = await Catalog.find({ supplierId: req.supplierId }).sort({ name: 1 });
+
+    // Self-heal: an account created before catalogs existed won't have any yet.
+    // Seed the same 3 defaults new suppliers get, once, the first time this is called.
+    if (catalogs.length === 0) {
+      catalogs = await Catalog.insertMany([
+        { supplierId: req.supplierId, name: 'Catalog 1' },
+        { supplierId: req.supplierId, name: 'Catalog 2' },
+        { supplierId: req.supplierId, name: 'Catalog 3' },
+      ]);
+    }
+
+    res.json(catalogs.map((c) => ({ id: c._id.toString(), name: c.name })));
+  } catch (err) {
+    console.error('List catalogs error:', err);
+    res.status(500).json({ error: 'Failed to load catalogs' });
+  }
+});
+
+app.post('/api/catalogs', authMiddleware, async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: 'Catalog name is required' });
+
+    const catalog = await Catalog.create({ supplierId: req.supplierId, name: name.trim() });
+    res.json({ id: catalog._id.toString(), name: catalog.name });
+  } catch (err) {
+    if (err.code === 11000) return res.status(409).json({ error: 'You already have a catalog with this name' });
+    console.error('Create catalog error:', err);
+    res.status(500).json({ error: 'Failed to create catalog' });
   }
 });
 
