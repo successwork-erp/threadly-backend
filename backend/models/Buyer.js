@@ -15,6 +15,9 @@ const buyerSchema = new mongoose.Schema({
   },
   // New buyers must be approved by a supplier on the web portal before they can log in.
   approvalStatus: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
+
+  // Which catalogs this buyer can see, granted at approval time. Empty until approved.
+  catalogIds: { type: [mongoose.Schema.Types.ObjectId], ref: 'Catalog', default: [] },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Buyer', buyerSchema);
