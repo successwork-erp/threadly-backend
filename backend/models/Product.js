@@ -62,6 +62,10 @@ const productSchema = new mongoose.Schema({
 
   status: { type: String, default: 'live' },
 
+  // Which catalogs (see Catalog model) this product belongs to. A buyer only sees
+  // products whose catalogIds overlap with the catalogs they were granted access to.
+  catalogIds: { type: [mongoose.Schema.Types.ObjectId], ref: 'Catalog', default: [] },
+
   // Marketing / growth features
   featured: { type: Boolean, default: false }, // "Promotions" — boosted visibility
   adBudget: { type: Number, default: 0 }, // "Advertisement" — daily ad spend supplier has set
