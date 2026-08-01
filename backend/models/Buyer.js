@@ -13,6 +13,8 @@ const buyerSchema = new mongoose.Schema({
     }],
     default: [],
   },
+  // New buyers must be approved by a supplier on the web portal before they can log in.
+  approvalStatus: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Buyer', buyerSchema);
