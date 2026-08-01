@@ -1294,6 +1294,197 @@ app.get('/api/reports/summary', authMiddleware, async (req, res) => {
   }
 });
 
+// Shared helper — builds a Mongo date filter from ?from=&to= query params.
+function buildDateFilter(from, to) {
+  const filter = {};
+  if (from) filter.$gte = new Date(from);
+  if (to) {
+    const toDate = new Date(to);
+    toDate.setHours(23, 59, 59, 999);
+    filter.$lte = toDate;
+  }
+  return Object.keys(filter).length > 0 ? filter : null;
+}
+
+// Detailed Sale report — every order as a line, for the Reports Suite "Sale" card.
+app.get('/api/reports/sale', authMiddleware, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const dateFilter = buildDateFilter(from, to);
+    const match = { supplierId: req.supplierId, ...(dateFilter ? { orderDate: dateFilter } : {}) };
+    const orders = await Order.find(match).sort({ orderDate: -1 });
+
+    res.json({
+      range: { from: from || null, to: to || null },
+      rows: orders.map((o) => ({
+        id: o._id.toString(),
+        date: o.orderDate,
+        buyerName: o.buyerName,
+        itemCount: o.items.length,
+        amount: o.totalAmount,
+        status: o.status,
+        paymentStatus: o.paymentStatus,
+      })),
+      totalAmount: Math.round(orders.filter((o) => o.status !== 'cancelled').reduce((s, o) => s + o.totalAmount, 0) * 100) / 100,
+    });
+  } catch (err) {
+    console.error('Sale report error:', err);
+    res.status(500).json({ error: 'Failed to generate sale report' });
+  }
+});
+
+// Detailed Purchase report — every purchase bill as a line, for the "Purchase" card.
+app.get('/api/reports/purchase', authMiddleware, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const dateFilter = buildDateFilter(from, to);
+    const match = { supplierId: req.supplierId, ...(dateFilter ? { billDate: dateFilter } : {}) };
+    const bills = await PurchaseBill.find(match).populate('partyId', 'name').sort({ billDate: -1 });
+
+    res.json({
+      range: { from: from || null, to: to || null },
+      rows: bills.map((b) => ({
+        id: b._id.toString(),
+        date: b.billDate,
+        partyName: b.partyId?.name || 'Unknown',
+        billNumber: b.billNumber,
+        itemCount: b.items.length,
+        totalAmount: b.totalAmount,
+        paidAmount: b.paidAmount,
+        balanceDue: b.balanceDue,
+      })),
+      totalAmount: Math.round(bills.reduce((s, b) => s + b.totalAmount, 0) * 100) / 100,
+    });
+  } catch (err) {
+    console.error('Purchase report error:', err);
+    res.status(500).json({ error: 'Failed to generate purchase report' });
+  }
+});
+
+// Day Book — every sale AND purchase transaction, mixed together in date order —
+// the classic "everything that happened, in order" ledger view.
+app.get('/api/reports/day-book', authMiddleware, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const dateFilter = buildDateFilter(from, to);
+    const supplierId = req.supplierId;
+
+    const orders = await Order.find({ supplierId, ...(dateFilter ? { orderDate: dateFilter } : {}) });
+    const bills = await PurchaseBill.find({ supplierId, ...(dateFilter ? { billDate: dateFilter } : {}) }).populate('partyId', 'name');
+
+    const rows = [
+      ...orders.filter((o) => o.status !== 'cancelled').map((o) => ({
+        date: o.orderDate,
+        type: 'Sale',
+        party: o.buyerName,
+        amount: o.totalAmount,
+        direction: 'in', // money coming in
+      })),
+      ...bills.map((b) => ({
+        date: b.billDate,
+        type: 'Purchase',
+        party: b.partyId?.name || 'Unknown',
+        amount: b.totalAmount,
+        direction: 'out', // money going out
+      })),
+    ].sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    res.json({ range: { from: from || null, to: to || null }, rows });
+  } catch (err) {
+    console.error('Day book error:', err);
+    res.status(500).json({ error: 'Failed to generate day book' });
+  }
+});
+
+// Profit & Loss — total sales revenue minus total purchase cost, for the period.
+// Simple version: doesn't account for unsold inventory (that would need proper
+// cost-of-goods-sold accounting) — this is revenue vs. spend, a common small-business view.
+app.get('/api/reports/profit-loss', authMiddleware, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const dateFilter = buildDateFilter(from, to);
+    const supplierId = req.supplierId;
+
+    const orders = await Order.find({ supplierId, ...(dateFilter ? { orderDate: dateFilter } : {}) });
+    const bills = await PurchaseBill.find({ supplierId, ...(dateFilter ? { billDate: dateFilter } : {}) });
+
+    const totalRevenue = Math.round(orders.filter((o) => o.status !== 'cancelled').reduce((s, o) => s + o.totalAmount, 0) * 100) / 100;
+    const totalPurchaseCost = Math.round(bills.reduce((s, b) => s + b.totalAmount, 0) * 100) / 100;
+    const netProfit = Math.round((totalRevenue - totalPurchaseCost) * 100) / 100;
+
+    res.json({
+      range: { from: from || null, to: to || null },
+      totalRevenue,
+      totalPurchaseCost,
+      netProfit,
+    });
+  } catch (err) {
+    console.error('Profit and loss report error:', err);
+    res.status(500).json({ error: 'Failed to generate profit & loss report' });
+  }
+});
+
+// Cash Flow — money in (paid orders) vs money out (paid purchase amounts), for the period.
+app.get('/api/reports/cash-flow', authMiddleware, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const dateFilter = buildDateFilter(from, to);
+    const supplierId = req.supplierId;
+
+    const orders = await Order.find({ supplierId, ...(dateFilter ? { orderDate: dateFilter } : {}), paymentStatus: 'paid' });
+    const bills = await PurchaseBill.find({ supplierId, ...(dateFilter ? { billDate: dateFilter } : {}) });
+
+    const cashIn = Math.round(orders.reduce((s, o) => s + o.totalAmount, 0) * 100) / 100;
+    const cashOut = Math.round(bills.reduce((s, b) => s + b.paidAmount, 0) * 100) / 100;
+    const netCashFlow = Math.round((cashIn - cashOut) * 100) / 100;
+
+    res.json({ range: { from: from || null, to: to || null }, cashIn, cashOut, netCashFlow });
+  } catch (err) {
+    console.error('Cash flow report error:', err);
+    res.status(500).json({ error: 'Failed to generate cash flow report' });
+  }
+});
+
+// Party Statement — every purchase bill for ONE specific party, with running balance.
+app.get('/api/reports/party-statement/:partyId', authMiddleware, async (req, res) => {
+  try {
+    const party = await Party.findOne({ _id: req.params.partyId, supplierId: req.supplierId });
+    if (!party) return res.status(404).json({ error: 'Party not found' });
+
+    const bills = await PurchaseBill.find({ partyId: party._id, supplierId: req.supplierId }).sort({ billDate: 1 });
+
+    res.json({
+      party: { id: party._id.toString(), name: party.name, balance: party.balance },
+      rows: bills.map((b) => ({
+        id: b._id.toString(),
+        date: b.billDate,
+        billNumber: b.billNumber,
+        totalAmount: b.totalAmount,
+        paidAmount: b.paidAmount,
+        balanceDue: b.balanceDue,
+      })),
+    });
+  } catch (err) {
+    console.error('Party statement error:', err);
+    res.status(500).json({ error: 'Failed to generate party statement' });
+  }
+});
+
+// All Parties — every party with their current balance (same data as Parties page,
+// but shaped as a report for the Reports Suite "All parties" card).
+app.get('/api/reports/all-parties', authMiddleware, async (req, res) => {
+  try {
+    const parties = await Party.find({ supplierId: req.supplierId }).sort({ name: 1 });
+    res.json({
+      rows: parties.map((p) => ({ id: p._id.toString(), name: p.name, phone: p.phone, balance: p.balance })),
+      totalOutstanding: Math.round(parties.reduce((s, p) => s + Math.max(0, p.balance), 0) * 100) / 100,
+    });
+  } catch (err) {
+    console.error('All parties report error:', err);
+    res.status(500).json({ error: 'Failed to generate all-parties report' });
+  }
+});
+
 // ================= PAYMENTS =================
 
 // Supplier: payments summary + list of orders with payment status
