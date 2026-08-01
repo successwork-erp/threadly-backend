@@ -589,6 +589,111 @@ app.post('/api/checkout', async (req, res) => {
   }
 });
 
+// Buyer: checkout an entire cart (multiple items) as ONE order/invoice —
+// use this instead of calling /api/checkout in a loop, which creates a
+// separate order per item. The old single-item /api/checkout above is
+// left untouched for anything already using it (e.g. a "Buy Now" button).
+app.post('/api/checkout/cart', async (req, res) => {
+  try {
+    const { items, buyerName, buyerMobile, shippingAddress, shippingPincode } = req.body;
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'items must be a non-empty array of { productId, size, quantity }' });
+    }
+    if (!buyerName || !buyerMobile || !shippingAddress) {
+      return res.status(400).json({ error: 'buyerName, buyerMobile, and shippingAddress are required' });
+    }
+
+    let buyerId = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader) {
+      try {
+        const decoded = jwt.verify(authHeader.replace('Bearer ', ''), JWT_SECRET);
+        if (decoded.type === 'buyer') buyerId = decoded.id;
+      } catch (e) {
+        // Invalid/expired token — proceed as guest rather than failing the order
+      }
+    }
+
+    // All items in a cart must belong to the same supplier — Threadly orders are per-supplier.
+    // Validate every line first (stock, size, product exists) before changing anything,
+    // so a bad item in the cart doesn't leave earlier items partially deducted.
+    const resolved = [];
+    let supplierId = null;
+
+    for (const line of items) {
+      const { productId, size, quantity } = line;
+      const qty = Number(quantity) > 0 ? Number(quantity) : 1;
+
+      if (!productId || !size) {
+        return res.status(400).json({ error: 'Each cart item needs a productId and size' });
+      }
+
+      const product = await Product.findById(productId);
+      if (!product) return res.status(404).json({ error: `Product not found: ${productId}` });
+      if (product.status !== 'live') return res.status(400).json({ error: `${product.title} is not currently available` });
+
+      if (supplierId === null) supplierId = product.supplierId.toString();
+      else if (supplierId !== product.supplierId.toString()) {
+        return res.status(400).json({ error: 'All items in one order must be from the same seller. Please check out sellers separately.' });
+      }
+
+      const sizeEntry = product.sizeStock.find((s) => s.size === size);
+      if (!sizeEntry) return res.status(400).json({ error: `Size ${size} is not available for ${product.title}` });
+      if (sizeEntry.stock < qty) {
+        return res.status(400).json({ error: `Only ${sizeEntry.stock} left of ${product.title} in size ${size}` });
+      }
+
+      resolved.push({ product, sizeEntry, size, qty });
+    }
+
+    // All validated — now deduct stock and build the order's item list together.
+    const orderItems = [];
+    let totalAmount = 0;
+    for (const { product, sizeEntry, size, qty } of resolved) {
+      sizeEntry.stock -= qty;
+      product.stock = product.sizeStock.reduce((sum, s) => sum + Number(s.stock || 0), 0);
+      await product.save();
+
+      orderItems.push({
+        productId: product._id,
+        title: product.title,
+        imageUrl: product.imageUrl,
+        size,
+        quantity: qty,
+        price: product.price,
+      });
+      totalAmount += product.price * qty;
+    }
+
+    const order = await Order.create({
+      supplierId,
+      buyerId,
+      items: orderItems,
+      totalAmount,
+      buyerName,
+      buyerMobile,
+      shippingAddress,
+      shippingPincode: shippingPincode || '',
+      status: 'pending',
+      paymentStatus: 'pending',
+    });
+
+    res.json({
+      success: true,
+      orderId: order._id.toString(),
+      itemCount: orderItems.length,
+      totalAmount,
+      message: 'Order placed successfully',
+    });
+  } catch (err) {
+    console.error('Cart checkout error:', err);
+    res.status(500).json({ error: 'Failed to place order' });
+  }
+});
+
+
+
 // ================= RAZORPAY PAYMENTS (test mode) =================
 
 // Buyer: create a Razorpay payment order for an existing Threadly order.
