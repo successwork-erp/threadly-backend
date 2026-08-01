@@ -16,6 +16,8 @@ const Product = require('./models/Product');
 const Order = require('./models/Order');
 const InstantCashRequest = require('./models/InstantCashRequest');
 const Review = require('./models/Review');
+const Party = require('./models/Party');
+const PurchaseBill = require('./models/PurchaseBill');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -969,6 +971,221 @@ app.put('/api/buyer-approvals/:id', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('Buyer approval action error:', err);
     res.status(500).json({ error: 'Failed to update buyer approval status' });
+  }
+});
+
+// ================= PARTIES (Vendors) =================
+// A "Party" is a vendor the supplier buys raw materials/stock from — separate from Buyers.
+
+app.get('/api/parties', authMiddleware, async (req, res) => {
+  try {
+    const parties = await Party.find({ supplierId: req.supplierId }).sort({ createdAt: -1 });
+    res.json(parties);
+  } catch (err) {
+    console.error('List parties error:', err);
+    res.status(500).json({ error: 'Failed to load parties' });
+  }
+});
+
+app.post('/api/parties', authMiddleware, async (req, res) => {
+  try {
+    const { name, phone, email, gstin, address, notes } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: 'Party name is required' });
+
+    const party = await Party.create({
+      supplierId: req.supplierId,
+      name: name.trim(),
+      phone: phone || '',
+      email: email || '',
+      gstin: gstin || '',
+      address: address || '',
+      notes: notes || '',
+    });
+    res.json(party);
+  } catch (err) {
+    console.error('Create party error:', err);
+    res.status(500).json({ error: 'Failed to create party' });
+  }
+});
+
+app.put('/api/parties/:id', authMiddleware, async (req, res) => {
+  try {
+    const party = await Party.findOne({ _id: req.params.id, supplierId: req.supplierId });
+    if (!party) return res.status(404).json({ error: 'Party not found' });
+
+    const { name, phone, email, gstin, address, notes } = req.body;
+    if (name !== undefined) party.name = name;
+    if (phone !== undefined) party.phone = phone;
+    if (email !== undefined) party.email = email;
+    if (gstin !== undefined) party.gstin = gstin;
+    if (address !== undefined) party.address = address;
+    if (notes !== undefined) party.notes = notes;
+    await party.save();
+
+    res.json(party);
+  } catch (err) {
+    console.error('Update party error:', err);
+    res.status(500).json({ error: 'Failed to update party' });
+  }
+});
+
+app.delete('/api/parties/:id', authMiddleware, async (req, res) => {
+  try {
+    const party = await Party.findOne({ _id: req.params.id, supplierId: req.supplierId });
+    if (!party) return res.status(404).json({ error: 'Party not found' });
+
+    const billCount = await PurchaseBill.countDocuments({ partyId: party._id });
+    if (billCount > 0) {
+      return res.status(400).json({ error: `Cannot delete — this party has ${billCount} purchase bill(s) on record.` });
+    }
+
+    await party.deleteOne();
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete party error:', err);
+    res.status(500).json({ error: 'Failed to delete party' });
+  }
+});
+
+// ================= PURCHASE BILLS =================
+
+app.get('/api/purchase-bills', authMiddleware, async (req, res) => {
+  try {
+    const bills = await PurchaseBill.find({ supplierId: req.supplierId }).populate('partyId', 'name phone').sort({ createdAt: -1 });
+    res.json(bills);
+  } catch (err) {
+    console.error('List purchase bills error:', err);
+    res.status(500).json({ error: 'Failed to load purchase bills' });
+  }
+});
+
+app.post('/api/purchase-bills', authMiddleware, async (req, res) => {
+  try {
+    const { partyId, billNumber, billDate, items, paidAmount, paymentType, notes } = req.body;
+
+    if (!partyId) return res.status(400).json({ error: 'A party (vendor) is required' });
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'At least one item is required' });
+
+    const party = await Party.findOne({ _id: partyId, supplierId: req.supplierId });
+    if (!party) return res.status(404).json({ error: 'Party not found' });
+
+    // Validate and compute each line item's amount server-side — never trust client-computed totals.
+    const cleanItems = [];
+    let totalAmount = 0;
+    for (const it of items) {
+      const quantity = Number(it.quantity);
+      const price = Number(it.price);
+      if (!it.itemName || !quantity || quantity <= 0 || !price || price < 0) {
+        return res.status(400).json({ error: 'Each item needs a name, a positive quantity, and a valid price' });
+      }
+      const amount = Math.round(quantity * price * 100) / 100;
+      totalAmount += amount;
+      cleanItems.push({ productId: it.productId || null, itemName: it.itemName, quantity, price, amount });
+    }
+    totalAmount = Math.round(totalAmount * 100) / 100;
+
+    const paid = Math.max(0, Number(paidAmount) || 0);
+    const balanceDue = Math.round((totalAmount - paid) * 100) / 100;
+
+    const bill = await PurchaseBill.create({
+      supplierId: req.supplierId,
+      partyId,
+      billNumber: billNumber || '',
+      billDate: billDate ? new Date(billDate) : new Date(),
+      items: cleanItems,
+      totalAmount,
+      paidAmount: paid,
+      paymentType: paymentType || 'Cash',
+      balanceDue,
+      notes: notes || '',
+    });
+
+    // Purchasing stock increases the linked product's stock — this is what "purchase logic" means:
+    // buying raw material/stock adds to what you have on hand to sell.
+    for (const it of cleanItems) {
+      if (it.productId) {
+        await Product.findByIdAndUpdate(it.productId, { $inc: { stock: it.quantity } });
+      }
+    }
+
+    // Update the vendor's running balance — what we still owe them.
+    party.balance = Math.round((party.balance + balanceDue) * 100) / 100;
+    await party.save();
+
+    res.json(bill);
+  } catch (err) {
+    console.error('Create purchase bill error:', err);
+    res.status(500).json({ error: 'Failed to create purchase bill' });
+  }
+});
+
+// ================= REPORTS =================
+
+app.get('/api/reports/summary', authMiddleware, async (req, res) => {
+  try {
+    const supplierId = req.supplierId;
+
+    // Parse date range — defaults to all-time if not provided.
+    const { from, to } = req.query;
+    const dateFilter = {};
+    if (from) dateFilter.$gte = new Date(from);
+    if (to) {
+      const toDate = new Date(to);
+      toDate.setHours(23, 59, 59, 999); // include the whole "to" day
+      dateFilter.$lte = toDate;
+    }
+    const hasDateFilter = Object.keys(dateFilter).length > 0;
+
+    // ---- Sales report (from Orders) ----
+    const orderMatch = { supplierId, ...(hasDateFilter ? { orderDate: dateFilter } : {}) };
+    const orders = await Order.find(orderMatch);
+    const validOrders = orders.filter((o) => o.status !== 'cancelled');
+    const salesReport = {
+      totalOrders: validOrders.length,
+      totalRevenue: Math.round(validOrders.reduce((s, o) => s + o.totalAmount, 0) * 100) / 100,
+      byStatus: ['pending', 'packed', 'shipped', 'delivered', 'cancelled', 'returned'].map((status) => ({
+        status,
+        count: orders.filter((o) => o.status === status).length,
+      })),
+    };
+
+    // ---- Purchase report (from PurchaseBills) ----
+    const billMatch = { supplierId, ...(hasDateFilter ? { billDate: dateFilter } : {}) };
+    const bills = await PurchaseBill.find(billMatch);
+    const purchaseReport = {
+      totalBills: bills.length,
+      totalPurchaseAmount: Math.round(bills.reduce((s, b) => s + b.totalAmount, 0) * 100) / 100,
+      totalPaid: Math.round(bills.reduce((s, b) => s + b.paidAmount, 0) * 100) / 100,
+      totalOutstanding: Math.round(bills.reduce((s, b) => s + b.balanceDue, 0) * 100) / 100,
+    };
+
+    // ---- Stock / Inventory report (current snapshot — not date-filtered, stock has no history) ----
+    const products = await Product.find({ supplierId });
+    const stockReport = {
+      totalProducts: products.length,
+      totalStockUnits: products.reduce((s, p) => s + (p.stock || 0), 0),
+      outOfStock: products.filter((p) => (p.stock || 0) === 0).length,
+      lowStock: products.filter((p) => (p.stock || 0) > 0 && (p.stock || 0) <= 5).length,
+    };
+
+    // ---- Party-wise balance report (current snapshot) ----
+    const parties = await Party.find({ supplierId }).sort({ balance: -1 });
+    const partyReport = {
+      totalParties: parties.length,
+      totalOutstanding: Math.round(parties.reduce((s, p) => s + Math.max(0, p.balance), 0) * 100) / 100,
+      parties: parties.map((p) => ({ id: p._id.toString(), name: p.name, balance: p.balance })),
+    };
+
+    res.json({
+      range: { from: from || null, to: to || null },
+      sales: salesReport,
+      purchase: purchaseReport,
+      stock: stockReport,
+      parties: partyReport,
+    });
+  } catch (err) {
+    console.error('Reports summary error:', err);
+    res.status(500).json({ error: 'Failed to generate report' });
   }
 });
 
