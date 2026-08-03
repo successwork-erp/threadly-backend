@@ -7,6 +7,7 @@ const mongoose = require('mongoose');
 const catalogSchema = new mongoose.Schema({
   supplierId: { type: mongoose.Schema.Types.ObjectId, ref: 'Supplier', required: true },
   name: { type: String, required: true },
+  status: { type: String, enum: ['active', 'inactive'], default: 'active' },
 }, { timestamps: true });
 
 // A supplier shouldn't have two catalogs with the exact same name.

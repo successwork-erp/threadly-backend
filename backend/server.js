@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -19,6 +20,7 @@ const Review = require('./models/Review');
 const Party = require('./models/Party');
 const PurchaseBill = require('./models/PurchaseBill');
 const Catalog = require('./models/Catalog');
+
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -297,7 +299,91 @@ app.post('/api/buyer/addresses', buyerAuthMiddleware, async (req, res) => {
   }
 });
 
+// ================= CATALOGS =================
+
+// Supplier: get all catalogs for the logged-in supplier
+app.get('/api/catalogs', authMiddleware, async (req, res) => {
+  try {
+    const catalogs = await Catalog.find({ supplierId: req.supplierId }).sort({ createdAt: -1 });
+    res.json(catalogs.map(c => ({ id: c._id.toString(), name: c.name, status: c.status, createdAt: c.createdAt })));
+  } catch (err) {
+    console.error('List catalogs error:', err);
+    res.status(500).json({ error: 'Failed to load catalogs' });
+  }
+});
+
+// Supplier: create a new catalog
+app.post('/api/catalogs', authMiddleware, async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ error: 'Catalog name is required' });
+
+    // Ensure no duplicate name for this supplier
+    const exists = await Catalog.findOne({ supplierId: req.supplierId, name });
+    if (exists) return res.status(409).json({ error: 'A catalog with this name already exists' });
+
+    const catalog = await Catalog.create({
+      supplierId: req.supplierId,
+      name,
+    });
+
+    res.json({ id: catalog._id.toString(), name: catalog.name, status: catalog.status, createdAt: catalog.createdAt });
+  } catch (err) {
+    console.error('Create catalog error:', err);
+    res.status(500).json({ error: 'Failed to create catalog' });
+  }
+});
+
+// Supplier: toggle catalog status
+app.put('/api/catalogs/:id/status', authMiddleware, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!status || !['active', 'inactive'].includes(status)) {
+      return res.status(400).json({ error: 'Valid status (active/inactive) is required' });
+    }
+    
+    const catalog = await Catalog.findOne({ _id: req.params.id, supplierId: req.supplierId });
+    if (!catalog) return res.status(404).json({ error: 'Catalog not found' });
+
+    catalog.status = status;
+    await catalog.save();
+
+    res.json({ id: catalog._id.toString(), name: catalog.name, status: catalog.status, createdAt: catalog.createdAt });
+  } catch (err) {
+    console.error('Update catalog status error:', err);
+    res.status(500).json({ error: 'Failed to update catalog status' });
+  }
+});
+
+// Supplier: get products inside a specific catalog
+app.get('/api/catalogs/:id/products', authMiddleware, async (req, res) => {
+  try {
+    const catalog = await Catalog.findOne({ _id: req.params.id, supplierId: req.supplierId });
+    if (!catalog) return res.status(404).json({ error: 'Catalog not found' });
+
+    const products = await Product.find({
+      supplierId: req.supplierId,
+      catalogIds: catalog._id,
+    }).sort({ createdAt: -1 });
+
+    res.json(products.map(p => ({
+      id: p._id.toString(),
+      title: p.title,
+      price: p.price,
+      mrp: p.mrp,
+      imageUrl: p.imageUrl || null,
+      status: p.status,
+      stock: p.stock,
+      createdAt: p.createdAt,
+    })));
+  } catch (err) {
+    console.error('Catalog products error:', err);
+    res.status(500).json({ error: 'Failed to load catalog products' });
+  }
+});
+
 // ================= PRODUCTS =================
+
 
 // Public: list all products (this is what the mobile app polls)
 app.get('/api/products', async (req, res) => {
