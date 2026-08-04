@@ -63,12 +63,136 @@ const cloudinaryStorage = new CloudinaryStorage({
   params: {
     folder: 'threadly',
     resource_type: 'auto', // auto-detects image vs video, needed for review media
-    allowed_formats: ['jpg', 'jpeg', 'png', 'webp', 'mp4', 'mov', 'webm'],
+    allowed_formats: ['jpg', 'jpeg', 'png', 'webp', 'gif', 'mp4', 'mov', 'webm'],
   },
 });
 const upload = multer({ storage: cloudinaryStorage });
 // Review media can include short video clips, so cap size a bit higher than a typical photo.
 const uploadReviewMedia = multer({ storage: cloudinaryStorage, limits: { fileSize: 25 * 1024 * 1024 } }); // 25MB per file
+// Excel product bulk import — keep file in memory (not Cloudinary)
+const uploadExcel = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    const name = (file.originalname || '').toLowerCase();
+    const ok =
+      name.endsWith('.xlsx') ||
+      name.endsWith('.xls') ||
+      name.endsWith('.csv') ||
+      file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+      file.mimetype === 'application/vnd.ms-excel' ||
+      file.mimetype === 'text/csv' ||
+      file.mimetype === 'application/csv';
+    if (!ok) return cb(new Error('Only Excel (.xlsx, .xls) or CSV files are allowed'));
+    cb(null, true);
+  },
+});
+const XLSX = require('xlsx');
+
+const PRODUCT_EXCEL_SIZE_COLS = ['XXS', 'XS', 'S', 'M', 'L', 'XL', 'XXL', '3XL', '4XL', '5XL', '6XL', '7XL'];
+const PRODUCT_EXCEL_HEADERS = [
+  'title', 'price', 'mrp', 'gst', 'hsnCode', 'netWeight', 'styleCode',
+  'color', 'fabric', 'fitShape', 'genericName', 'netQuantity', 'neck', 'occasion',
+  'pattern', 'printOrPatternType', 'sleeveLength', 'countryOfOrigin',
+  'brand', 'character', 'hemline', 'length', 'numberOfPockets', 'sleeveStyling', 'style', 'description',
+  'manufacturerName', 'manufacturerAddress', 'manufacturerPincode',
+  'packerName', 'packerAddress', 'packerPincode',
+  'importerName', 'importerAddress', 'importerPincode',
+  'imageUrl1', 'imageUrl2', 'imageUrl3', 'imageUrl4',
+  ...PRODUCT_EXCEL_SIZE_COLS,
+];
+
+function normalizeExcelHeader(h) {
+  return String(h || '')
+    .trim()
+    .replace(/^\uFEFF/, '')
+    .toLowerCase()
+    .replace(/[\s_\-]+/g, '');
+}
+
+const EXCEL_HEADER_ALIASES = {
+  title: ['title', 'productname', 'name', 'producttitle'],
+  price: ['price', 'sellingprice', 'sp'],
+  mrp: ['mrp', 'maximumretailprice'],
+  gst: ['gst', 'gstpercent', 'gst%'],
+  hsncode: ['hsncode', 'hsn'],
+  netweight: ['netweight', 'weight'],
+  stylecode: ['stylecode', 'sku', 'skucode'],
+  color: ['color', 'colour', 'colors', 'colours'],
+  fabric: ['fabric'],
+  fitshape: ['fitshape', 'fit'],
+  genericname: ['genericname'],
+  netquantity: ['netquantity', 'qty', 'quantity'],
+  neck: ['neck', 'necktype'],
+  occasion: ['occasion'],
+  pattern: ['pattern'],
+  printorpatterntype: ['printorpatterntype', 'printtype', 'print'],
+  sleevelength: ['sleevelength', 'sleeve'],
+  countryoforigin: ['countryoforigin', 'country'],
+  brand: ['brand'],
+  character: ['character'],
+  hemline: ['hemline'],
+  length: ['length'],
+  numberofpockets: ['numberofpockets', 'pockets'],
+  sleevestyling: ['sleevestyling'],
+  style: ['style'],
+  description: ['description', 'desc'],
+  manufacturername: ['manufacturername', 'manufacturer'],
+  manufactureraddress: ['manufactureraddress'],
+  manufacturerpincode: ['manufacturerpincode'],
+  packername: ['packername', 'packer'],
+  packeraddress: ['packeraddress'],
+  packerpincode: ['packerpincode'],
+  importername: ['importername', 'importer'],
+  importeraddress: ['importeraddress'],
+  importerpincode: ['importerpincode'],
+  imageurl1: ['imageurl1', 'image1', 'imageurl', 'image'],
+  imageurl2: ['imageurl2', 'image2'],
+  imageurl3: ['imageurl3', 'image3'],
+  imageurl4: ['imageurl4', 'image4'],
+};
+
+PRODUCT_EXCEL_SIZE_COLS.forEach((sz) => {
+  const key = normalizeExcelHeader(sz);
+  EXCEL_HEADER_ALIASES[key] = [key, `stock${key}`, `size${key}`];
+});
+
+function mapExcelRow(rawRow) {
+  const mapped = {};
+  const normToCanon = {};
+  Object.keys(EXCEL_HEADER_ALIASES).forEach((canon) => {
+    EXCEL_HEADER_ALIASES[canon].forEach((alias) => {
+      normToCanon[alias] = canon;
+    });
+  });
+
+  Object.keys(rawRow || {}).forEach((header) => {
+    const norm = normalizeExcelHeader(header);
+    const canon = normToCanon[norm];
+    if (!canon) return;
+    const val = rawRow[header];
+    if (val === undefined || val === null || String(val).trim() === '') return;
+    mapped[canon] = typeof val === 'string' ? val.trim() : val;
+  });
+  return mapped;
+}
+
+function buildSizeStockFromExcelRow(row) {
+  const sizeStock = [];
+  PRODUCT_EXCEL_SIZE_COLS.forEach((sz) => {
+    const key = normalizeExcelHeader(sz);
+    if (row[key] === undefined || row[key] === null || String(row[key]).trim() === '') return;
+    const stock = Number(row[key]);
+    if (Number.isNaN(stock) || stock < 0) return;
+    sizeStock.push({ size: sz, stock });
+  });
+  return sizeStock;
+}
+
+function cellStr(v) {
+  if (v === undefined || v === null) return '';
+  return String(v).trim();
+}
 
 // ---- Auth middleware ----
 function authMiddleware(req, res, next) {
@@ -516,6 +640,221 @@ app.post('/api/products', authMiddleware, upload.array('images', 6), async (req,
     console.error('Add product error:', err);
     res.status(500).json({ error: 'Failed to add product' });
   }
+});
+
+// Supplier: download Excel template for bulk product upload
+app.get('/api/products/excel-template', authMiddleware, (req, res) => {
+  try {
+    const sample = {
+      title: 'Classic Cotton Tee',
+      price: 499,
+      mrp: 799,
+      gst: '5%',
+      hsnCode: '6109',
+      netWeight: '180',
+      styleCode: 'TEE-001',
+      color: 'Black,White',
+      fabric: 'Cotton',
+      fitShape: 'Regular',
+      genericName: 'T-Shirt',
+      netQuantity: '1',
+      neck: 'Round Neck',
+      occasion: 'Casual',
+      pattern: 'Solid',
+      printOrPatternType: 'Solid',
+      sleeveLength: 'Short Sleeve',
+      countryOfOrigin: 'India',
+      brand: 'Threadly',
+      character: '',
+      hemline: 'Straight',
+      length: 'Regular',
+      numberOfPockets: '0',
+      sleeveStyling: 'Regular',
+      style: 'Casual',
+      description: 'Soft cotton everyday t-shirt',
+      manufacturerName: '',
+      manufacturerAddress: '',
+      manufacturerPincode: '',
+      packerName: '',
+      packerAddress: '',
+      packerPincode: '',
+      importerName: '',
+      importerAddress: '',
+      importerPincode: '',
+      imageUrl1: '',
+      imageUrl2: '',
+      imageUrl3: '',
+      imageUrl4: '',
+      XXS: '',
+      XS: '',
+      S: 10,
+      M: 20,
+      L: 15,
+      XL: 10,
+      XXL: 5,
+      '3XL': '',
+      '4XL': '',
+      '5XL': '',
+      '6XL': '',
+      '7XL': '',
+    };
+    const ws = XLSX.utils.json_to_sheet([sample], { header: PRODUCT_EXCEL_HEADERS });
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Products');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="threadly-product-upload-template.xlsx"');
+    res.send(buf);
+  } catch (err) {
+    console.error('Excel template error:', err);
+    res.status(500).json({ error: 'Failed to generate Excel template' });
+  }
+});
+
+// Supplier: bulk create products from Excel / CSV
+app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
+  uploadExcel.single('file')(req, res, async (err) => {
+    if (err) {
+      return res.status(400).json({ error: err.message || 'Invalid Excel file' });
+    }
+    try {
+      if (!req.file || !req.file.buffer) {
+        return res.status(400).json({ error: 'Excel file is required (field name: file)' });
+      }
+
+      let catalogIds = [];
+      try {
+        if (req.body.catalogIds) {
+          catalogIds = typeof req.body.catalogIds === 'string'
+            ? JSON.parse(req.body.catalogIds)
+            : req.body.catalogIds;
+        } else if (req.body.catalogId) {
+          catalogIds = [req.body.catalogId];
+        }
+      } catch (e) {
+        return res.status(400).json({ error: 'catalogIds must be a valid JSON array' });
+      }
+      if (!Array.isArray(catalogIds) || catalogIds.length === 0) {
+        return res.status(400).json({ error: 'At least one catalog is required' });
+      }
+
+      const workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: false });
+      const sheetName = workbook.SheetNames[0];
+      if (!sheetName) return res.status(400).json({ error: 'Excel file has no sheets' });
+      const sheet = workbook.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
+      if (!rows.length) return res.status(400).json({ error: 'Excel sheet is empty' });
+
+      const created = [];
+      const errors = [];
+      const MAX_ROWS = 200;
+
+      for (let i = 0; i < rows.length; i++) {
+        const rowNum = i + 2; // header is row 1
+        if (i >= MAX_ROWS) {
+          errors.push({ row: rowNum, error: `Skipped — max ${MAX_ROWS} products per upload` });
+          continue;
+        }
+
+        const mapped = mapExcelRow(rows[i]);
+        const title = cellStr(mapped.title);
+        const priceRaw = mapped.price;
+        if (!title || priceRaw === undefined || priceRaw === null || cellStr(priceRaw) === '') {
+          errors.push({ row: rowNum, error: 'title and price are required' });
+          continue;
+        }
+        const price = Number(priceRaw);
+        if (Number.isNaN(price) || price < 0) {
+          errors.push({ row: rowNum, title, error: 'price must be a valid number' });
+          continue;
+        }
+
+        const mrpRaw = mapped.mrp;
+        const mrp = mrpRaw !== undefined && cellStr(mrpRaw) !== '' ? Number(mrpRaw) : price;
+        if (Number.isNaN(mrp) || mrp < 0) {
+          errors.push({ row: rowNum, title, error: 'mrp must be a valid number' });
+          continue;
+        }
+
+        const sizeStock = buildSizeStockFromExcelRow(mapped);
+        const finalSizeStock = sizeStock.length > 0 ? sizeStock : [{ size: 'M', stock: 0 }];
+        const stock = finalSizeStock.reduce((sum, s) => sum + Number(s.stock || 0), 0);
+
+        const imageUrls = [mapped.imageurl1, mapped.imageurl2, mapped.imageurl3, mapped.imageurl4]
+          .map(cellStr)
+          .filter((u) => u && /^https?:\/\//i.test(u))
+          .slice(0, 6);
+
+        const color = cellStr(mapped.color)
+          ? cellStr(mapped.color).split(',').map((c) => c.trim()).filter(Boolean)
+          : [];
+
+        try {
+          const product = await Product.create({
+            supplierId: req.supplierId,
+            category: 'T-Shirt',
+            gst: cellStr(mapped.gst),
+            hsnCode: cellStr(mapped.hsncode),
+            netWeight: cellStr(mapped.netweight),
+            styleCode: cellStr(mapped.stylecode),
+            title,
+            price,
+            mrp,
+            color,
+            fabric: cellStr(mapped.fabric),
+            fitShape: cellStr(mapped.fitshape),
+            genericName: cellStr(mapped.genericname),
+            netQuantity: cellStr(mapped.netquantity) || '1',
+            neck: cellStr(mapped.neck),
+            occasion: cellStr(mapped.occasion),
+            pattern: cellStr(mapped.pattern),
+            printOrPatternType: cellStr(mapped.printorpatterntype),
+            sleeveLength: cellStr(mapped.sleevelength),
+            countryOfOrigin: cellStr(mapped.countryoforigin) || 'India',
+            manufacturerName: cellStr(mapped.manufacturername),
+            manufacturerAddress: cellStr(mapped.manufactureraddress),
+            manufacturerPincode: cellStr(mapped.manufacturerpincode),
+            packerName: cellStr(mapped.packername),
+            packerAddress: cellStr(mapped.packeraddress),
+            packerPincode: cellStr(mapped.packerpincode),
+            importerName: cellStr(mapped.importername),
+            importerAddress: cellStr(mapped.importeraddress),
+            importerPincode: cellStr(mapped.importerpincode),
+            brand: cellStr(mapped.brand),
+            character: cellStr(mapped.character),
+            hemline: cellStr(mapped.hemline),
+            length: cellStr(mapped.length),
+            numberOfPockets: cellStr(mapped.numberofpockets),
+            sleeveStyling: cellStr(mapped.sleevestyling),
+            style: cellStr(mapped.style),
+            description: cellStr(mapped.description),
+            sizeStock: finalSizeStock,
+            stock,
+            imageUrls,
+            imageUrl: imageUrls.length > 0 ? imageUrls[0] : null,
+            status: 'live',
+            catalogIds,
+          });
+          created.push(safeProduct(product));
+        } catch (createErr) {
+          console.error('Bulk excel row create error:', createErr);
+          errors.push({ row: rowNum, title, error: createErr.message || 'Failed to create product' });
+        }
+      }
+
+      res.json({
+        success: true,
+        totalRows: rows.length,
+        createdCount: created.length,
+        errorCount: errors.length,
+        created,
+        errors,
+      });
+    } catch (e) {
+      console.error('Bulk excel upload error:', e);
+      res.status(500).json({ error: 'Failed to import products from Excel' });
+    }
+  });
 });
 
 // Supplier: update a product
@@ -2000,54 +2339,93 @@ app.get('/api/dashboard/summary', authMiddleware, async (req, res) => {
 });
 
 // ---- Banner Routes ----
+function bannerImageUpload(req, res, next) {
+  upload.single('image')(req, res, (err) => {
+    if (err) {
+      console.error('Banner image upload error:', err);
+      return res.status(400).json({
+        error: err.message || 'Banner image upload failed. Use JPG, PNG, or WEBP.',
+      });
+    }
+    next();
+  });
+}
+
+function bannerImageUrl(file) {
+  if (!file) return null;
+  return file.path || file.secure_url || file.url || null;
+}
+
+function safeBanner(doc) {
+  const b = doc.toObject ? doc.toObject() : doc;
+  const { __v, _id, ...rest } = b;
+  return { ...rest, id: (_id || b.id).toString(), _id: (_id || b.id).toString() };
+}
+
 // Supplier: Get all banners
 app.get('/api/banners', authMiddleware, async (req, res) => {
   try {
-    const banners = await Banner.find({ supplierId: req.supplierId });
-    res.json(banners);
+    const banners = await Banner.find({ supplierId: req.supplierId }).sort({ createdAt: -1 });
+    res.json(banners.map(safeBanner));
   } catch (err) {
     console.error('Get banners error:', err);
-    res.status(500).json({ error: 'Failed to load banners' });
+    res.status(500).json({ error: 'Failed to load banners', detail: err.message });
   }
 });
 
 // Supplier: Create new banner
-app.post('/api/banners', authMiddleware, async (req, res) => {
+app.post('/api/banners', authMiddleware, bannerImageUpload, async (req, res) => {
   try {
-    const { title, imageUrl, linkUrl, isActive } = req.body;
-    if (!title || !imageUrl) return res.status(400).json({ error: 'Title and imageUrl are required' });
-    const banner = new Banner({
+    const { title, linkUrl, isActive } = req.body;
+    if (!title || !String(title).trim()) {
+      return res.status(400).json({ error: 'Title is required' });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'Image file is required' });
+    }
+
+    const imageUrl = bannerImageUrl(req.file);
+    if (!imageUrl) {
+      return res.status(500).json({ error: 'Image upload did not return a URL. Check Cloudinary config.' });
+    }
+
+    const banner = await Banner.create({
       supplierId: req.supplierId,
-      title,
+      title: String(title).trim(),
       imageUrl,
       linkUrl: linkUrl || '',
-      isActive: isActive !== false
+      isActive: !(isActive === 'false' || isActive === false || isActive === '0'),
     });
-    await banner.save();
-    res.status(201).json(banner);
+    res.status(201).json(safeBanner(banner));
   } catch (err) {
     console.error('Create banner error:', err);
-    res.status(500).json({ error: 'Failed to create banner' });
+    res.status(500).json({ error: err.message || 'Failed to create banner' });
   }
 });
 
 // Supplier: Edit banner
-app.put('/api/banners/:id', authMiddleware, async (req, res) => {
+app.put('/api/banners/:id', authMiddleware, bannerImageUpload, async (req, res) => {
   try {
-    const { title, imageUrl, linkUrl, isActive } = req.body;
+    const { title, linkUrl, isActive } = req.body;
     const banner = await Banner.findOne({ _id: req.params.id, supplierId: req.supplierId });
     if (!banner) return res.status(404).json({ error: 'Banner not found' });
-    
-    if (title !== undefined) banner.title = title;
-    if (imageUrl !== undefined) banner.imageUrl = imageUrl;
+
+    if (title !== undefined) banner.title = String(title).trim();
     if (linkUrl !== undefined) banner.linkUrl = linkUrl;
-    if (isActive !== undefined) banner.isActive = isActive;
-    
+    if (isActive !== undefined) banner.isActive = isActive === 'true' || isActive === true;
+    if (req.file) {
+      const imageUrl = bannerImageUrl(req.file);
+      if (!imageUrl) {
+        return res.status(500).json({ error: 'Image upload did not return a URL. Check Cloudinary config.' });
+      }
+      banner.imageUrl = imageUrl;
+    }
+
     await banner.save();
-    res.json(banner);
+    res.json(safeBanner(banner));
   } catch (err) {
     console.error('Edit banner error:', err);
-    res.status(500).json({ error: 'Failed to update banner' });
+    res.status(500).json({ error: err.message || 'Failed to update banner' });
   }
 });
 
@@ -2059,18 +2437,18 @@ app.delete('/api/banners/:id', authMiddleware, async (req, res) => {
     res.json({ message: 'Banner deleted successfully' });
   } catch (err) {
     console.error('Delete banner error:', err);
-    res.status(500).json({ error: 'Failed to delete banner' });
+    res.status(500).json({ error: 'Failed to delete banner', detail: err.message });
   }
 });
 
 // Public / Buyer: Get active banners
 app.get('/api/banners/active', async (req, res) => {
   try {
-    const banners = await Banner.find({ isActive: true });
-    res.json(banners);
+    const banners = await Banner.find({ isActive: true }).sort({ createdAt: -1 });
+    res.json(banners.map(safeBanner));
   } catch (err) {
     console.error('Get active banners error:', err);
-    res.status(500).json({ error: 'Failed to load active banners' });
+    res.status(500).json({ error: 'Failed to load active banners', detail: err.message });
   }
 });
 
