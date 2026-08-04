@@ -974,6 +974,79 @@ app.get('/api/orders', authMiddleware, async (req, res) => {
   }
 });
 
+// Supplier: stock-check — cross-references pending order items vs live product sizeStock
+// Returns a map: { [orderId]: { hasStockIssue: bool, items: [{ productId, size, ordered, available, status }] } }
+app.get('/api/orders/stock-check', authMiddleware, async (req, res) => {
+  try {
+    // Only check pending orders (not yet packed/shipped)
+    const orders = await Order.find({
+      supplierId: req.supplierId,
+      status: { $in: ['pending', 'packed'] }
+    }).sort({ createdAt: -1 });
+
+    if (orders.length === 0) return res.json({});
+
+    // Collect all unique productIds across all orders
+    const productIds = [...new Set(
+      orders.flatMap(o => o.items.map(it => it.productId.toString()))
+    )];
+
+    // Fetch all relevant products in one query
+    const products = await Product.find({ _id: { $in: productIds } }).select('_id sizeStock stock title');
+    const productMap = {};
+    products.forEach(p => { productMap[p._id.toString()] = p; });
+
+    // Build the result map
+    const result = {};
+    orders.forEach(order => {
+      const orderId = order._id.toString();
+      const itemResults = order.items.map(item => {
+        const pid = item.productId.toString();
+        const product = productMap[pid];
+        let available = 0;
+
+        if (product) {
+          // Try per-size stock first
+          const sizeEntry = (product.sizeStock || []).find(
+            s => s.size && s.size.toLowerCase() === (item.size || '').toLowerCase()
+          );
+          if (sizeEntry) {
+            available = sizeEntry.stock || 0;
+          } else {
+            // Fall back to total stock
+            available = product.stock || 0;
+          }
+        }
+
+        const ordered = item.quantity || 1;
+        let status;
+        if (available <= 0) status = 'outOfStock';
+        else if (available < ordered) status = 'partial';
+        else status = 'inStock';
+
+        return {
+          productId: pid,
+          title: item.title,
+          size: item.size,
+          ordered,
+          available,
+          status, // 'inStock' | 'partial' | 'outOfStock'
+        };
+      });
+
+      const hasStockIssue = itemResults.some(it => it.status !== 'inStock');
+      result[orderId] = { hasStockIssue, items: itemResults };
+    });
+
+    res.json(result);
+  } catch (err) {
+    console.error('Stock check error:', err);
+    res.status(500).json({ error: 'Failed to check stock' });
+  }
+});
+
+
+
 // Supplier: get one order
 app.get('/api/orders/:id', authMiddleware, async (req, res) => {
   try {
