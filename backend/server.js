@@ -69,12 +69,19 @@ const cloudinaryStorage = new CloudinaryStorage({
 const upload = multer({ storage: cloudinaryStorage });
 // Review media can include short video clips, so cap size a bit higher than a typical photo.
 const uploadReviewMedia = multer({ storage: cloudinaryStorage, limits: { fileSize: 25 * 1024 * 1024 } }); // 25MB per file
-// Excel product bulk import — keep file in memory (not Cloudinary)
+// Excel product bulk import — Excel in memory + optional product images
 const uploadExcel = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB — pricelists can be large
+  limits: { fileSize: 50 * 1024 * 1024, files: 520 }, // 50MB per file; excel + many images
   fileFilter: (req, file, cb) => {
     const name = (file.originalname || '').toLowerCase();
+    if (file.fieldname === 'images') {
+      const okImg =
+        /\.(jpe?g|png|webp|gif)$/i.test(name) ||
+        /^image\/(jpeg|jpg|png|webp|gif)$/i.test(file.mimetype || '');
+      if (!okImg) return cb(new Error('Product images must be JPG, PNG, WEBP, or GIF'));
+      return cb(null, true);
+    }
     const ok =
       name.endsWith('.xlsx') ||
       name.endsWith('.xls') ||
@@ -83,7 +90,7 @@ const uploadExcel = multer({
       file.mimetype === 'application/vnd.ms-excel' ||
       file.mimetype === 'text/csv' ||
       file.mimetype === 'application/csv';
-    if (!ok) return cb(new Error('Only Excel (.xlsx, .xls) or CSV files are allowed'));
+    if (!ok) return cb(new Error('Only Excel (.xlsx, .xls) or CSV files are allowed for the sheet'));
     cb(null, true);
   },
 });
@@ -108,6 +115,112 @@ function normalizeExcelHeader(h) {
     .replace(/^\uFEFF/, '')
     .toLowerCase()
     .replace(/[\s_\-]+/g, '');
+}
+
+function normalizeStyleKey(s) {
+  return String(s || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function uploadBufferToCloudinary(buffer, filename) {
+  return new Promise((resolve, reject) => {
+    if (!cloudinaryConfigured) {
+      return reject(new Error('Cloudinary is not configured'));
+    }
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: 'threadly',
+        resource_type: 'image',
+      },
+      (err, result) => {
+        if (err) return reject(err);
+        resolve(result.secure_url || result.url);
+      }
+    );
+    stream.end(buffer);
+  });
+}
+
+async function resolveImageUrlsFromSources({ urlCandidates, styleCode, rowNum, imageMap }) {
+  const out = [];
+  const seen = new Set();
+
+  const pushUrl = (u) => {
+    if (!u || seen.has(u)) return;
+    seen.add(u);
+    out.push(u);
+  };
+
+  // 1) Uploaded image files matched by styleCode / rowN
+  const styleKey = normalizeStyleKey(styleCode);
+  const rowKey = 'row' + rowNum;
+  const fileBuckets = [];
+  if (styleKey && imageMap.has(styleKey)) fileBuckets.push(...imageMap.get(styleKey));
+  if (imageMap.has(rowKey)) fileBuckets.push(...imageMap.get(rowKey));
+
+  fileBuckets.sort((a, b) => a.index - b.index);
+  for (const item of fileBuckets.slice(0, 6)) {
+    try {
+      const url = await uploadBufferToCloudinary(item.buffer, item.originalname);
+      pushUrl(url);
+    } catch (e) {
+      console.error('Cloudinary upload for excel image failed:', e.message || e);
+    }
+    if (out.length >= 6) return out;
+  }
+
+  // 2) HTTP(S) URLs from Excel columns — upload to Cloudinary so they stay permanent
+  for (const raw of urlCandidates) {
+    if (out.length >= 6) break;
+    const u = cellStr(raw);
+    if (!u || !/^https?:\/\//i.test(u)) continue;
+    try {
+      if (cloudinaryConfigured) {
+        const result = await cloudinary.uploader.upload(u, {
+          folder: 'threadly',
+          resource_type: 'image',
+        });
+        pushUrl(result.secure_url || result.url || u);
+      } else {
+        pushUrl(u);
+      }
+    } catch (e) {
+      console.error('Cloudinary URL import failed, keeping original URL:', e.message || e);
+      pushUrl(u);
+    }
+  }
+
+  return out;
+}
+
+/** Build map: normalized styleKey / rowN → [{ index, buffer, originalname }] */
+function buildExcelImageMap(imageFiles) {
+  const map = new Map();
+  (imageFiles || []).forEach((f) => {
+    const base = path.parse(f.originalname || 'image').name; // e.g. TEE-001_2
+    const rowMatch = base.match(/^row\s*[_\-]?\s*(\d+)$/i);
+    let key;
+    let index = 1;
+    if (rowMatch) {
+      key = 'row' + rowMatch[1];
+      index = 1;
+    } else {
+      const m = base.match(/^(.*?)(?:\s*[_\-]\s*(\d+))?$/);
+      const stylePart = (m && m[1]) || base;
+      index = m && m[2] ? Number(m[2]) : 1;
+      key = normalizeStyleKey(stylePart);
+    }
+    if (!key) return;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push({
+      index: Number.isFinite(index) ? index : 1,
+      buffer: f.buffer,
+      originalname: f.originalname,
+    });
+  });
+  return map;
 }
 
 const EXCEL_HEADER_ALIASES = {
@@ -681,8 +794,8 @@ app.get('/api/products/excel-template', authMiddleware, (req, res) => {
       importerName: '',
       importerAddress: '',
       importerPincode: '',
-      imageUrl1: '',
-      imageUrl2: '',
+      imageUrl1: 'https://example.com/tee-front.jpg',
+      imageUrl2: 'https://example.com/tee-back.jpg',
       imageUrl3: '',
       imageUrl4: '',
       XXS: '',
@@ -698,9 +811,19 @@ app.get('/api/products/excel-template', authMiddleware, (req, res) => {
       '6XL': '',
       '7XL': '',
     };
+    const instructions = [
+      { step: 1, instruction: 'Fill one product per row. title and price are required.' },
+      { step: 2, instruction: 'Set styleCode uniquely (e.g. TEE-001). Name image files the same: TEE-001.jpg, TEE-001_2.jpg' },
+      { step: 3, instruction: 'OR put public image links in imageUrl1–imageUrl4 columns.' },
+      { step: 4, instruction: 'On upload page: select Excel + optionally select all product image files together.' },
+      { step: 5, instruction: 'You can also name images by Excel row: row2.jpg for the first data row (row 2).' },
+      { step: 6, instruction: 'Size stock: fill columns S, M, L, XL, etc. with quantity numbers.' },
+    ];
     const ws = XLSX.utils.json_to_sheet([sample], { header: PRODUCT_EXCEL_HEADERS });
+    const wsInfo = XLSX.utils.json_to_sheet(instructions);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Products');
+    XLSX.utils.book_append_sheet(wb, wsInfo, 'Image Instructions');
     const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', 'attachment; filename="threadly-product-upload-template.xlsx"');
@@ -711,17 +834,25 @@ app.get('/api/products/excel-template', authMiddleware, (req, res) => {
   }
 });
 
-// Supplier: bulk create products from Excel / CSV
+// Supplier: bulk create products from Excel / CSV (+ optional product images)
 app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
-  uploadExcel.single('file')(req, res, async (err) => {
+  uploadExcel.fields([
+    { name: 'file', maxCount: 1 },
+    { name: 'images', maxCount: 500 },
+  ])(req, res, async (err) => {
     if (err) {
       if (err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(400).json({ error: 'File too large. Max Excel size is 50MB.' });
+        return res.status(400).json({ error: 'File too large. Max size is 50MB per file.' });
       }
-      return res.status(400).json({ error: err.message || 'Invalid Excel file' });
+      if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') {
+        return res.status(400).json({ error: err.message || 'Too many files uploaded' });
+      }
+      return res.status(400).json({ error: err.message || 'Invalid upload' });
     }
     try {
-      if (!req.file || !req.file.buffer) {
+      const excelFile = req.files && req.files.file && req.files.file[0];
+      const imageFiles = (req.files && req.files.images) || [];
+      if (!excelFile || !excelFile.buffer) {
         return res.status(400).json({ error: 'Excel file is required (field name: file)' });
       }
 
@@ -741,13 +872,15 @@ app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
         return res.status(400).json({ error: 'At least one catalog is required' });
       }
 
-      const workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: false });
-      const sheetName = workbook.SheetNames[0];
+      const workbook = XLSX.read(excelFile.buffer, { type: 'buffer', cellDates: false });
+      const sheetName = workbook.SheetNames.find((n) => String(n).toLowerCase() !== 'image instructions')
+        || workbook.SheetNames[0];
       if (!sheetName) return res.status(400).json({ error: 'Excel file has no sheets' });
       const sheet = workbook.Sheets[sheetName];
       const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
       if (!rows.length) return res.status(400).json({ error: 'Excel sheet is empty' });
 
+      const imageMap = buildExcelImageMap(imageFiles);
       const created = [];
       const errors = [];
       const MAX_ROWS = 2000;
@@ -782,11 +915,19 @@ app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
         const sizeStock = buildSizeStockFromExcelRow(mapped);
         const finalSizeStock = sizeStock.length > 0 ? sizeStock : [{ size: 'M', stock: 0 }];
         const stock = finalSizeStock.reduce((sum, s) => sum + Number(s.stock || 0), 0);
+        const styleCode = cellStr(mapped.stylecode);
 
-        const imageUrls = [mapped.imageurl1, mapped.imageurl2, mapped.imageurl3, mapped.imageurl4]
-          .map(cellStr)
-          .filter((u) => u && /^https?:\/\//i.test(u))
-          .slice(0, 6);
+        let imageUrls = [];
+        try {
+          imageUrls = await resolveImageUrlsFromSources({
+            urlCandidates: [mapped.imageurl1, mapped.imageurl2, mapped.imageurl3, mapped.imageurl4],
+            styleCode,
+            rowNum,
+            imageMap,
+          });
+        } catch (imgErr) {
+          console.error('Image resolve error:', imgErr);
+        }
 
         const color = cellStr(mapped.color)
           ? cellStr(mapped.color).split(',').map((c) => c.trim()).filter(Boolean)
@@ -799,7 +940,7 @@ app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
             gst: cellStr(mapped.gst),
             hsnCode: cellStr(mapped.hsncode),
             netWeight: cellStr(mapped.netweight),
-            styleCode: cellStr(mapped.stylecode),
+            styleCode,
             title,
             price,
             mrp,
@@ -850,6 +991,7 @@ app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
         totalRows: rows.length,
         createdCount: created.length,
         errorCount: errors.length,
+        imagesReceived: imageFiles.length,
         created,
         errors,
       });
