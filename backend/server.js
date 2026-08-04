@@ -1108,7 +1108,13 @@ app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
             status: 'live',
             catalogIds,
           });
-          created.push(safeProduct(product));
+          created.push({
+            id: product._id.toString(),
+            title: product.title,
+            price: product.price,
+            imageUrl: product.imageUrl || null,
+            imageUrls: product.imageUrls || [],
+          });
         } catch (createErr) {
           console.error('Bulk excel row create error:', createErr);
           errors.push({ row: rowNum, title, error: createErr.message || 'Failed to create product' });
@@ -1121,6 +1127,7 @@ app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
         createdCount: created.length,
         errorCount: errors.length,
         imagesReceived: imageFiles.length,
+        embeddedImagesFound: embeddedByRow.size,
         created,
         errors,
       });
