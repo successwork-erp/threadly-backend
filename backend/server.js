@@ -20,6 +20,7 @@ const Review = require('./models/Review');
 const Party = require('./models/Party');
 const PurchaseBill = require('./models/PurchaseBill');
 const Catalog = require('./models/Catalog');
+const Banner = require('./models/Banner');
 
 
 const app = express();
@@ -1995,6 +1996,81 @@ app.get('/api/dashboard/summary', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('Dashboard summary error:', err);
     res.status(500).json({ error: 'Failed to load dashboard summary' });
+  }
+});
+
+// ---- Banner Routes ----
+// Supplier: Get all banners
+app.get('/api/banners', authMiddleware, async (req, res) => {
+  try {
+    const banners = await Banner.find({ supplierId: req.supplierId });
+    res.json(banners);
+  } catch (err) {
+    console.error('Get banners error:', err);
+    res.status(500).json({ error: 'Failed to load banners' });
+  }
+});
+
+// Supplier: Create new banner
+app.post('/api/banners', authMiddleware, async (req, res) => {
+  try {
+    const { title, imageUrl, linkUrl, isActive } = req.body;
+    if (!title || !imageUrl) return res.status(400).json({ error: 'Title and imageUrl are required' });
+    const banner = new Banner({
+      supplierId: req.supplierId,
+      title,
+      imageUrl,
+      linkUrl: linkUrl || '',
+      isActive: isActive !== false
+    });
+    await banner.save();
+    res.status(201).json(banner);
+  } catch (err) {
+    console.error('Create banner error:', err);
+    res.status(500).json({ error: 'Failed to create banner' });
+  }
+});
+
+// Supplier: Edit banner
+app.put('/api/banners/:id', authMiddleware, async (req, res) => {
+  try {
+    const { title, imageUrl, linkUrl, isActive } = req.body;
+    const banner = await Banner.findOne({ _id: req.params.id, supplierId: req.supplierId });
+    if (!banner) return res.status(404).json({ error: 'Banner not found' });
+    
+    if (title !== undefined) banner.title = title;
+    if (imageUrl !== undefined) banner.imageUrl = imageUrl;
+    if (linkUrl !== undefined) banner.linkUrl = linkUrl;
+    if (isActive !== undefined) banner.isActive = isActive;
+    
+    await banner.save();
+    res.json(banner);
+  } catch (err) {
+    console.error('Edit banner error:', err);
+    res.status(500).json({ error: 'Failed to update banner' });
+  }
+});
+
+// Supplier: Delete banner
+app.delete('/api/banners/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await Banner.deleteOne({ _id: req.params.id, supplierId: req.supplierId });
+    if (result.deletedCount === 0) return res.status(404).json({ error: 'Banner not found' });
+    res.json({ message: 'Banner deleted successfully' });
+  } catch (err) {
+    console.error('Delete banner error:', err);
+    res.status(500).json({ error: 'Failed to delete banner' });
+  }
+});
+
+// Public / Buyer: Get active banners
+app.get('/api/banners/active', async (req, res) => {
+  try {
+    const banners = await Banner.find({ isActive: true });
+    res.json(banners);
+  } catch (err) {
+    console.error('Get active banners error:', err);
+    res.status(500).json({ error: 'Failed to load active banners' });
   }
 });
 
