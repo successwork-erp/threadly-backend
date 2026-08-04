@@ -97,15 +97,17 @@ const uploadExcel = multer({
 const XLSX = require('xlsx');
 
 const PRODUCT_EXCEL_SIZE_COLS = ['XXS', 'XS', 'S', 'M', 'L', 'XL', 'XXL', '3XL', '4XL', '5XL', '6XL', '7XL'];
+// image1–image4 sit next to title/price — fill with public https image links in the sheet
 const PRODUCT_EXCEL_HEADERS = [
-  'title', 'price', 'mrp', 'gst', 'hsnCode', 'netWeight', 'styleCode',
+  'title', 'price', 'mrp', 'styleCode',
+  'image1', 'image2', 'image3', 'image4',
+  'gst', 'hsnCode', 'netWeight',
   'color', 'fabric', 'fitShape', 'genericName', 'netQuantity', 'neck', 'occasion',
   'pattern', 'printOrPatternType', 'sleeveLength', 'countryOfOrigin',
   'brand', 'character', 'hemline', 'length', 'numberOfPockets', 'sleeveStyling', 'style', 'description',
   'manufacturerName', 'manufacturerAddress', 'manufacturerPincode',
   'packerName', 'packerAddress', 'packerPincode',
   'importerName', 'importerAddress', 'importerPincode',
-  'imageUrl1', 'imageUrl2', 'imageUrl3', 'imageUrl4',
   ...PRODUCT_EXCEL_SIZE_COLS,
 ];
 
@@ -171,24 +173,29 @@ async function resolveImageUrlsFromSources({ urlCandidates, styleCode, rowNum, i
     if (out.length >= 6) return out;
   }
 
-  // 2) HTTP(S) URLs from Excel columns — upload to Cloudinary so they stay permanent
+  // HTTP(S) URLs from Excel columns (image1–image4) — same sheet as title/price
   for (const raw of urlCandidates) {
     if (out.length >= 6) break;
-    const u = cellStr(raw);
-    if (!u || !/^https?:\/\//i.test(u)) continue;
-    try {
-      if (cloudinaryConfigured) {
-        const result = await cloudinary.uploader.upload(u, {
-          folder: 'threadly',
-          resource_type: 'image',
-        });
-        pushUrl(result.secure_url || result.url || u);
-      } else {
+    const cell = cellStr(raw);
+    if (!cell) continue;
+    const parts = cell.split(/[\s,|;]+/).map((s) => s.trim()).filter(Boolean);
+    for (const u of parts) {
+      if (out.length >= 6) break;
+      if (!/^https?:\/\//i.test(u)) continue;
+      try {
+        if (cloudinaryConfigured) {
+          const result = await cloudinary.uploader.upload(u, {
+            folder: 'threadly',
+            resource_type: 'image',
+          });
+          pushUrl(result.secure_url || result.url || u);
+        } else {
+          pushUrl(u);
+        }
+      } catch (e) {
+        console.error('Cloudinary URL import failed, keeping original URL:', e.message || e);
         pushUrl(u);
       }
-    } catch (e) {
-      console.error('Cloudinary URL import failed, keeping original URL:', e.message || e);
-      pushUrl(u);
     }
   }
 
@@ -259,10 +266,10 @@ const EXCEL_HEADER_ALIASES = {
   importername: ['importername', 'importer'],
   importeraddress: ['importeraddress'],
   importerpincode: ['importerpincode'],
-  imageurl1: ['imageurl1', 'image1', 'imageurl', 'image'],
-  imageurl2: ['imageurl2', 'image2'],
-  imageurl3: ['imageurl3', 'image3'],
-  imageurl4: ['imageurl4', 'image4'],
+  imageurl1: ['imageurl1', 'image1', 'imageurl', 'image', 'photo', 'photo1', 'productimage', 'productimage1'],
+  imageurl2: ['imageurl2', 'image2', 'photo2', 'productimage2'],
+  imageurl3: ['imageurl3', 'image3', 'photo3', 'productimage3'],
+  imageurl4: ['imageurl4', 'image4', 'photo4', 'productimage4'],
 };
 
 PRODUCT_EXCEL_SIZE_COLS.forEach((sz) => {
@@ -762,10 +769,14 @@ app.get('/api/products/excel-template', authMiddleware, (req, res) => {
       title: 'Classic Cotton Tee',
       price: 499,
       mrp: 799,
+      styleCode: 'TEE-001',
+      image1: 'https://example.com/tee-front.jpg',
+      image2: 'https://example.com/tee-back.jpg',
+      image3: '',
+      image4: '',
       gst: '5%',
       hsnCode: '6109',
       netWeight: '180',
-      styleCode: 'TEE-001',
       color: 'Black,White',
       fabric: 'Cotton',
       fitShape: 'Regular',
@@ -794,10 +805,6 @@ app.get('/api/products/excel-template', authMiddleware, (req, res) => {
       importerName: '',
       importerAddress: '',
       importerPincode: '',
-      imageUrl1: 'https://example.com/tee-front.jpg',
-      imageUrl2: 'https://example.com/tee-back.jpg',
-      imageUrl3: '',
-      imageUrl4: '',
       XXS: '',
       XS: '',
       S: 10,
@@ -812,18 +819,18 @@ app.get('/api/products/excel-template', authMiddleware, (req, res) => {
       '7XL': '',
     };
     const instructions = [
-      { step: 1, instruction: 'Fill one product per row. title and price are required.' },
-      { step: 2, instruction: 'Set styleCode uniquely (e.g. TEE-001). Name image files the same: TEE-001.jpg, TEE-001_2.jpg' },
-      { step: 3, instruction: 'OR put public image links in imageUrl1–imageUrl4 columns.' },
-      { step: 4, instruction: 'On upload page: select Excel + optionally select all product image files together.' },
-      { step: 5, instruction: 'You can also name images by Excel row: row2.jpg for the first data row (row 2).' },
-      { step: 6, instruction: 'Size stock: fill columns S, M, L, XL, etc. with quantity numbers.' },
+      { step: 1, instruction: 'One product per row. title and price are required — same as other columns.' },
+      { step: 2, instruction: 'Put product photo LINKS in columns image1, image2, image3, image4 (https://...).' },
+      { step: 3, instruction: 'Example: image1 = https://your-cdn.com/photo1.jpg  |  image2 = https://your-cdn.com/photo2.jpg' },
+      { step: 4, instruction: 'Do not upload images separately — only fill these columns in the Excel sheet.' },
+      { step: 5, instruction: 'Size stock: fill S, M, L, XL columns with quantities.' },
+      { step: 6, instruction: 'Then upload only this Excel file on the portal.' },
     ];
     const ws = XLSX.utils.json_to_sheet([sample], { header: PRODUCT_EXCEL_HEADERS });
     const wsInfo = XLSX.utils.json_to_sheet(instructions);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Products');
-    XLSX.utils.book_append_sheet(wb, wsInfo, 'Image Instructions');
+    XLSX.utils.book_append_sheet(wb, wsInfo, 'Instructions');
     const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', 'attachment; filename="threadly-product-upload-template.xlsx"');
@@ -873,8 +880,10 @@ app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
       }
 
       const workbook = XLSX.read(excelFile.buffer, { type: 'buffer', cellDates: false });
-      const sheetName = workbook.SheetNames.find((n) => String(n).toLowerCase() !== 'image instructions')
-        || workbook.SheetNames[0];
+      const sheetName = workbook.SheetNames.find((n) => {
+        const low = String(n).toLowerCase();
+        return low !== 'image instructions' && low !== 'instructions';
+      }) || workbook.SheetNames[0];
       if (!sheetName) return res.status(400).json({ error: 'Excel file has no sheets' });
       const sheet = workbook.Sheets[sheetName];
       const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
