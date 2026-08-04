@@ -95,12 +95,12 @@ const uploadExcel = multer({
   },
 });
 const XLSX = require('xlsx');
+const JSZip = require('jszip');
 
 const PRODUCT_EXCEL_SIZE_COLS = ['XXS', 'XS', 'S', 'M', 'L', 'XL', 'XXL', '3XL', '4XL', '5XL', '6XL', '7XL'];
-// image1–image4 sit next to title/price — fill with public https image links in the sheet
+// Columns for product data. Insert device photos INTO the Excel row (Insert → Pictures), not as URL text.
 const PRODUCT_EXCEL_HEADERS = [
   'title', 'price', 'mrp', 'styleCode',
-  'image1', 'image2', 'image3', 'image4',
   'gst', 'hsnCode', 'netWeight',
   'color', 'fabric', 'fitShape', 'genericName', 'netQuantity', 'neck', 'occasion',
   'pattern', 'printOrPatternType', 'sleeveLength', 'countryOfOrigin',
@@ -145,7 +145,96 @@ function uploadBufferToCloudinary(buffer, filename) {
   });
 }
 
-async function resolveImageUrlsFromSources({ urlCandidates, styleCode, rowNum, imageMap }) {
+/**
+ * Extract pictures inserted in an .xlsx (device photos via Insert → Pictures).
+ * Returns Map<excelRowNumber (1-based), Array<{ col, buffer, name }>>
+ */
+async function extractEmbeddedImagesByRow(xlsxBuffer) {
+  const byRow = new Map();
+  try {
+    const zip = await JSZip.loadAsync(xlsxBuffer);
+    const drawingFiles = Object.keys(zip.files).filter((p) =>
+      /^xl\/drawings\/drawing\d+\.xml$/i.test(p) && !zip.files[p].dir
+    );
+
+    const pushToRow = (excelRow, col, buffer, name) => {
+      if (!excelRow || excelRow < 1 || !buffer || !buffer.length) return;
+      if (!byRow.has(excelRow)) byRow.set(excelRow, []);
+      byRow.get(excelRow).push({ col: col || 0, buffer, name: name || 'image.jpg' });
+    };
+
+    for (const drawingPath of drawingFiles) {
+      const drawingXml = await zip.file(drawingPath).async('string');
+      const baseName = drawingPath.split('/').pop(); // drawing1.xml
+      const relsPath = `xl/drawings/_rels/${baseName}.rels`;
+      const relsFile = zip.file(relsPath);
+      const ridToMedia = {};
+      if (relsFile) {
+        const relsXml = await relsFile.async('string');
+        const relRe = /<Relationship\b[^>]*>/gi;
+        let m;
+        while ((m = relRe.exec(relsXml))) {
+          const tag = m[0];
+          const idMatch = tag.match(/\bId="([^"]+)"/i);
+          const targetMatch = tag.match(/\bTarget="([^"]+)"/i);
+          if (!idMatch || !targetMatch) continue;
+          let target = targetMatch[1].replace(/\\/g, '/');
+          // ../media/image1.png → xl/media/image1.png
+          if (target.startsWith('../')) target = 'xl/' + target.replace(/^\.\.\//, '');
+          else if (!target.startsWith('xl/')) target = 'xl/drawings/' + target;
+          ridToMedia[idMatch[1]] = target;
+        }
+      }
+
+      const anchorRe = /<(?:xdr:)?(?:twoCellAnchor|oneCellAnchor)\b[^>]*>([\s\S]*?)<\/(?:xdr:)?(?:twoCellAnchor|oneCellAnchor)>/gi;
+      let anchorMatch;
+      while ((anchorMatch = anchorRe.exec(drawingXml))) {
+        const block = anchorMatch[1];
+        const fromBlock = block.match(/<(?:xdr:)?from>([\s\S]*?)<\/(?:xdr:)?from>/i);
+        let row0 = 0;
+        let col0 = 0;
+        if (fromBlock) {
+          const rowM = fromBlock[1].match(/<(?:xdr:)?row>(\d+)<\/(?:xdr:)?row>/i);
+          const colM = fromBlock[1].match(/<(?:xdr:)?col>(\d+)<\/(?:xdr:)?col>/i);
+          if (rowM) row0 = parseInt(rowM[1], 10);
+          if (colM) col0 = parseInt(colM[1], 10);
+        }
+        const embedM = block.match(/r:(?:embed|link)="([^"]+)"/i);
+        if (!embedM) continue;
+        const mediaPath = ridToMedia[embedM[1]];
+        if (!mediaPath || !zip.file(mediaPath)) continue;
+        const buffer = await zip.file(mediaPath).async('nodebuffer');
+        const name = mediaPath.split('/').pop() || 'image.jpg';
+        // OOXML row is 0-based → Excel row number is +1
+        pushToRow(row0 + 1, col0, buffer, name);
+      }
+    }
+
+    // Sort images in each row by column (left → right)
+    byRow.forEach((list, row) => {
+      list.sort((a, b) => a.col - b.col);
+      byRow.set(row, list.slice(0, 6));
+    });
+
+    // Fallback: if drawings had no anchors but media exists, keep media list for sequential assign later
+    if (byRow.size === 0) {
+      const mediaPaths = Object.keys(zip.files)
+        .filter((p) => /^xl\/media\/.+\.(jpe?g|png|webp|gif)$/i.test(p) && !zip.files[p].dir)
+        .sort();
+      const fallback = [];
+      for (const mediaPath of mediaPaths) {
+        const buffer = await zip.file(mediaPath).async('nodebuffer');
+        fallback.push({ buffer, name: mediaPath.split('/').pop() });
+      }
+      if (fallback.length) byRow.set('__sequential__', fallback);
+    }
+  } catch (e) {
+    console.error('extractEmbeddedImagesByRow error:', e.message || e);
+  }
+  return byRow;
+}
+
+async function resolveImageUrlsFromSources({ urlCandidates, styleCode, rowNum, imageMap, embeddedByRow, sequentialImages }) {
   const out = [];
   const seen = new Set();
 
@@ -155,46 +244,74 @@ async function resolveImageUrlsFromSources({ urlCandidates, styleCode, rowNum, i
     out.push(u);
   };
 
-  // 1) Uploaded image files matched by styleCode / rowN
-  const styleKey = normalizeStyleKey(styleCode);
-  const rowKey = 'row' + rowNum;
-  const fileBuckets = [];
-  if (styleKey && imageMap.has(styleKey)) fileBuckets.push(...imageMap.get(styleKey));
-  if (imageMap.has(rowKey)) fileBuckets.push(...imageMap.get(rowKey));
-
-  fileBuckets.sort((a, b) => a.index - b.index);
-  for (const item of fileBuckets.slice(0, 6)) {
+  // 1) Pictures inserted in the Excel sheet on this row (from device via Insert → Pictures)
+  const embedded = (embeddedByRow && embeddedByRow.get(rowNum)) || [];
+  for (const item of embedded.slice(0, 6)) {
     try {
-      const url = await uploadBufferToCloudinary(item.buffer, item.originalname);
+      const url = await uploadBufferToCloudinary(item.buffer, item.name || 'excel-image.jpg');
       pushUrl(url);
     } catch (e) {
-      console.error('Cloudinary upload for excel image failed:', e.message || e);
+      console.error('Cloudinary upload for embedded excel image failed:', e.message || e);
     }
-    if (out.length >= 6) return out;
   }
 
-  // HTTP(S) URLs from Excel columns (image1–image4) — same sheet as title/price
-  for (const raw of urlCandidates) {
-    if (out.length >= 6) break;
-    const cell = cellStr(raw);
-    if (!cell) continue;
-    const parts = cell.split(/[\s,|;]+/).map((s) => s.trim()).filter(Boolean);
-    for (const u of parts) {
-      if (out.length >= 6) break;
-      if (!/^https?:\/\//i.test(u)) continue;
+  // 1b) Sequential fallback: one media file per data row when anchors missing
+  if (out.length === 0 && sequentialImages && sequentialImages.length) {
+    // rowNum 2 → index 0, rowNum 3 → index 1, ...
+    const idx = rowNum - 2;
+    if (idx >= 0 && idx < sequentialImages.length) {
       try {
-        if (cloudinaryConfigured) {
-          const result = await cloudinary.uploader.upload(u, {
-            folder: 'threadly',
-            resource_type: 'image',
-          });
-          pushUrl(result.secure_url || result.url || u);
-        } else {
+        const item = sequentialImages[idx];
+        const url = await uploadBufferToCloudinary(item.buffer, item.name || 'excel-image.jpg');
+        pushUrl(url);
+      } catch (e) {
+        console.error('Cloudinary sequential excel image failed:', e.message || e);
+      }
+    }
+  }
+
+  // 2) Optional uploaded sidecar image files (legacy)
+  if (out.length < 6) {
+    const styleKey = normalizeStyleKey(styleCode);
+    const rowKey = 'row' + rowNum;
+    const fileBuckets = [];
+    if (styleKey && imageMap && imageMap.has(styleKey)) fileBuckets.push(...imageMap.get(styleKey));
+    if (imageMap && imageMap.has(rowKey)) fileBuckets.push(...imageMap.get(rowKey));
+    fileBuckets.sort((a, b) => a.index - b.index);
+    for (const item of fileBuckets.slice(0, 6 - out.length)) {
+      try {
+        const url = await uploadBufferToCloudinary(item.buffer, item.originalname);
+        pushUrl(url);
+      } catch (e) {
+        console.error('Cloudinary upload for excel image failed:', e.message || e);
+      }
+    }
+  }
+
+  // 3) Optional https links in cells (fallback only)
+  if (out.length < 6) {
+    for (const raw of urlCandidates || []) {
+      if (out.length >= 6) break;
+      const cell = cellStr(raw);
+      if (!cell) continue;
+      const parts = cell.split(/[\s,|;]+/).map((s) => s.trim()).filter(Boolean);
+      for (const u of parts) {
+        if (out.length >= 6) break;
+        if (!/^https?:\/\//i.test(u)) continue;
+        try {
+          if (cloudinaryConfigured) {
+            const result = await cloudinary.uploader.upload(u, {
+              folder: 'threadly',
+              resource_type: 'image',
+            });
+            pushUrl(result.secure_url || result.url || u);
+          } else {
+            pushUrl(u);
+          }
+        } catch (e) {
+          console.error('Cloudinary URL import failed, keeping original URL:', e.message || e);
           pushUrl(u);
         }
-      } catch (e) {
-        console.error('Cloudinary URL import failed, keeping original URL:', e.message || e);
-        pushUrl(u);
       }
     }
   }
@@ -206,7 +323,7 @@ async function resolveImageUrlsFromSources({ urlCandidates, styleCode, rowNum, i
 function buildExcelImageMap(imageFiles) {
   const map = new Map();
   (imageFiles || []).forEach((f) => {
-    const base = path.parse(f.originalname || 'image').name; // e.g. TEE-001_2
+    const base = path.parse(f.originalname || 'image').name;
     const rowMatch = base.match(/^row\s*[_\-]?\s*(\d+)$/i);
     let key;
     let index = 1;
@@ -770,10 +887,6 @@ app.get('/api/products/excel-template', authMiddleware, (req, res) => {
       price: 499,
       mrp: 799,
       styleCode: 'TEE-001',
-      image1: 'https://example.com/tee-front.jpg',
-      image2: 'https://example.com/tee-back.jpg',
-      image3: '',
-      image4: '',
       gst: '5%',
       hsnCode: '6109',
       netWeight: '180',
@@ -819,14 +932,16 @@ app.get('/api/products/excel-template', authMiddleware, (req, res) => {
       '7XL': '',
     };
     const instructions = [
-      { step: 1, instruction: 'One product per row. title and price are required — same as other columns.' },
-      { step: 2, instruction: 'Put product photo LINKS in columns image1, image2, image3, image4 (https://...).' },
-      { step: 3, instruction: 'Example: image1 = https://your-cdn.com/photo1.jpg  |  image2 = https://your-cdn.com/photo2.jpg' },
-      { step: 4, instruction: 'Do not upload images separately — only fill these columns in the Excel sheet.' },
-      { step: 5, instruction: 'Size stock: fill S, M, L, XL columns with quantities.' },
-      { step: 6, instruction: 'Then upload only this Excel file on the portal.' },
+      { step: 1, instruction: 'One product per row. title and price are required.' },
+      { step: 2, instruction: 'Add photos FROM YOUR DEVICE into the Excel file: select the product row → Insert → Pictures → Place over Cells (or This Device).' },
+      { step: 3, instruction: 'Put each product photo on the SAME row as that product (row 2 for first product, row 3 for second, ...). You can add up to 6 photos per row.' },
+      { step: 4, instruction: 'Do NOT paste image URLs. Use real picture files inserted into the sheet.' },
+      { step: 5, instruction: 'Save as .xlsx (not CSV — CSV cannot store pictures).' },
+      { step: 6, instruction: 'Upload that Excel file on the portal. Photos are uploaded automatically with each product.' },
     ];
     const ws = XLSX.utils.json_to_sheet([sample], { header: PRODUCT_EXCEL_HEADERS });
+    // Leave empty space on the right for users to drop pictures next to the sample row
+    ws['!cols'] = PRODUCT_EXCEL_HEADERS.map(() => ({ wch: 14 }));
     const wsInfo = XLSX.utils.json_to_sheet(instructions);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Products');
@@ -890,6 +1005,9 @@ app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
       if (!rows.length) return res.status(400).json({ error: 'Excel sheet is empty' });
 
       const imageMap = buildExcelImageMap(imageFiles);
+      const embeddedByRow = await extractEmbeddedImagesByRow(excelFile.buffer);
+      const sequentialImages = embeddedByRow.get('__sequential__') || [];
+      embeddedByRow.delete('__sequential__');
       const created = [];
       const errors = [];
       const MAX_ROWS = 2000;
@@ -933,6 +1051,8 @@ app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
             styleCode,
             rowNum,
             imageMap,
+            embeddedByRow,
+            sequentialImages,
           });
         } catch (imgErr) {
           console.error('Image resolve error:', imgErr);
