@@ -8,7 +8,11 @@ const buyerSchema = new mongoose.Schema({
   addresses: {
     type: [{
       label: { type: String, default: 'Home' }, // e.g. Home, Work
+      name: { type: String, default: '' },
+      mobile: { type: String, default: '' },
       address: { type: String, required: true },
+      city: { type: String, default: '' },
+      state: { type: String, default: '' },
       pincode: { type: String, default: '' },
     }],
     default: [],

@@ -911,6 +911,34 @@ app.get('/api/buyer/me', buyerAuthMiddleware, async (req, res) => {
   }
 });
 
+// Buyer: update profile (name / mobile)
+app.put('/api/buyer/me', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const buyer = await Buyer.findById(req.buyerId);
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+
+    const { name, mobile } = req.body;
+    if (name !== undefined) {
+      const trimmed = String(name).trim();
+      if (!trimmed) return res.status(400).json({ error: 'Name cannot be empty' });
+      buyer.name = trimmed;
+    }
+    if (mobile !== undefined) {
+      const trimmed = String(mobile).trim();
+      if (trimmed.length < 10) return res.status(400).json({ error: 'Enter a valid mobile number' });
+      const taken = await Buyer.findOne({ mobile: trimmed, _id: { $ne: buyer._id } });
+      if (taken) return res.status(409).json({ error: 'This mobile number is already in use' });
+      buyer.mobile = trimmed;
+    }
+
+    await buyer.save();
+    res.json(safeBuyer(buyer));
+  } catch (err) {
+    console.error('Update buyer profile error:', err);
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
 // Buyer: view own order history (this is the actual feature buyer accounts unlock —
 // a real "My Orders" list, instead of needing to save each Order ID separately)
 app.get('/api/buyer/orders', buyerAuthMiddleware, async (req, res) => {
@@ -924,6 +952,43 @@ app.get('/api/buyer/orders', buyerAuthMiddleware, async (req, res) => {
   } catch (err) {
     console.error('Buyer orders error:', err);
     res.status(500).json({ error: 'Failed to load orders' });
+  }
+});
+
+// Buyer: cancel own order (only while pending or packed)
+app.put('/api/buyer/orders/:id/cancel', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const order = await Order.findOne({ _id: req.params.id, buyerId: req.buyerId });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    if (!['pending', 'packed'].includes(order.status)) {
+      return res.status(400).json({
+        error: 'Only pending or packed orders can be cancelled',
+        status: order.status,
+      });
+    }
+
+    // Restock items
+    for (const item of order.items || []) {
+      const product = await Product.findById(item.productId);
+      if (!product) continue;
+      const sizeEntry = (product.sizeStock || []).find((s) => s.size === item.size);
+      if (sizeEntry) {
+        sizeEntry.stock += Number(item.quantity) || 0;
+        product.stock = product.sizeStock.reduce((sum, s) => sum + Number(s.stock || 0), 0);
+        await product.save();
+      }
+    }
+
+    order.status = 'cancelled';
+    await order.save();
+
+    const obj = order.toObject();
+    const { __v, _id, supplierId, buyerId, ...rest } = obj;
+    res.json({ ...rest, id: _id.toString(), message: 'Order cancelled' });
+  } catch (err) {
+    console.error('Buyer cancel order error:', err);
+    res.status(500).json({ error: 'Failed to cancel order' });
   }
 });
 
@@ -968,17 +1033,47 @@ app.get('/api/buyer/addresses', buyerAuthMiddleware, async (req, res) => {
 
 app.post('/api/buyer/addresses', buyerAuthMiddleware, async (req, res) => {
   try {
-    const { label, address, pincode } = req.body;
+    const { label, address, pincode, name, mobile, city, state } = req.body;
     if (!address) return res.status(400).json({ error: 'address is required' });
 
     const buyer = await Buyer.findById(req.buyerId);
     if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
 
-    buyer.addresses.push({ label: label || 'Home', address, pincode: pincode || '' });
+    buyer.addresses.push({
+      label: label || 'Home',
+      name: name || buyer.name || '',
+      mobile: mobile || buyer.mobile || '',
+      address,
+      city: city || '',
+      state: state || '',
+      pincode: pincode || '',
+    });
     await buyer.save();
     res.json(buyer.addresses);
   } catch (err) {
     res.status(500).json({ error: 'Failed to add address' });
+  }
+});
+
+// Buyer: delete a saved address by index
+app.delete('/api/buyer/addresses/:index', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const index = Number(req.params.index);
+    if (!Number.isInteger(index) || index < 0) {
+      return res.status(400).json({ error: 'Invalid address index' });
+    }
+
+    const buyer = await Buyer.findById(req.buyerId);
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+    if (index >= buyer.addresses.length) {
+      return res.status(404).json({ error: 'Address not found' });
+    }
+
+    buyer.addresses.splice(index, 1);
+    await buyer.save();
+    res.json(buyer.addresses);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete address' });
   }
 });
 
@@ -1633,13 +1728,19 @@ app.post('/api/checkout/cart', async (req, res) => {
         return res.status(400).json({ error: 'All items in one order must be from the same seller. Please check out sellers separately.' });
       }
 
-      const sizeEntry = product.sizeStock.find((s) => s.size === size);
+      let sizeEntry = (product.sizeStock || []).find((s) => s.size === size);
+      let resolvedSize = size;
+      // Soft fallback: if cart size doesn't match (e.g. default "M"), use first in-stock size
+      if (!sizeEntry && Array.isArray(product.sizeStock) && product.sizeStock.length > 0) {
+        sizeEntry = product.sizeStock.find((s) => Number(s.stock) > 0) || product.sizeStock[0];
+        resolvedSize = sizeEntry.size;
+      }
       if (!sizeEntry) return res.status(400).json({ error: `Size ${size} is not available for ${product.title}` });
       if (sizeEntry.stock < qty) {
-        return res.status(400).json({ error: `Only ${sizeEntry.stock} left of ${product.title} in size ${size}` });
+        return res.status(400).json({ error: `Only ${sizeEntry.stock} left of ${product.title} in size ${resolvedSize}` });
       }
 
-      resolved.push({ product, sizeEntry, size, qty });
+      resolved.push({ product, sizeEntry, size: resolvedSize, qty });
     }
 
     // All validated — now deduct stock and build the order's item list together.
