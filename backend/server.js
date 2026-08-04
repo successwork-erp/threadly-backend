@@ -761,8 +761,12 @@ function buyerAuthMiddleware(req, res, next) {
 
 function safeBuyer(buyerDoc) {
   const b = buyerDoc.toObject ? buyerDoc.toObject() : buyerDoc;
-  const { password, __v, ...rest } = b;
-  return { ...rest, id: b._id.toString() };
+  const { password, securityAnswer, __v, ...rest } = b;
+  return {
+    ...rest,
+    id: b._id.toString(),
+    hasSecurityQuestion: Boolean(b.securityQuestion),
+  };
 }
 
 function safeProduct(productDoc, supplierName) {
@@ -847,7 +851,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
 // Buyer: register a new account
 app.post('/api/buyer/register', async (req, res) => {
   try {
-    const { name, email, mobile, password } = req.body;
+    const { name, email, mobile, password, securityQuestion, securityAnswer } = req.body;
     if (!name || !email || !mobile || !password) {
       return res.status(400).json({ error: 'Name, email, mobile and password are required' });
     }
@@ -856,9 +860,21 @@ app.post('/api/buyer/register', async (req, res) => {
     if (exists) return res.status(409).json({ error: 'An account with this email or mobile already exists' });
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    const buyer = await Buyer.create({ name, email, mobile, password: hashedPassword, approvalStatus: 'pending' });
+    let hashedAnswer = null;
+    if (securityQuestion && securityAnswer && String(securityAnswer).trim()) {
+      hashedAnswer = await bcrypt.hash(String(securityAnswer).trim().toLowerCase(), 10);
+    }
 
-    // No token here — buyers cannot log in until a supplier approves them on the web portal.
+    const buyer = await Buyer.create({
+      name,
+      email,
+      mobile,
+      password: hashedPassword,
+      securityQuestion: securityQuestion || null,
+      securityAnswer: hashedAnswer,
+      approvalStatus: 'pending',
+    });
+
     res.json({
       success: true,
       message: 'Registration submitted. Your account will be reviewed and you can log in once approved.',
@@ -867,6 +883,73 @@ app.post('/api/buyer/register', async (req, res) => {
   } catch (err) {
     console.error('Buyer register error:', err);
     res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// Buyer: verify identity for password reset (security question)
+app.post('/api/buyer/forgot-password/verify', async (req, res) => {
+  try {
+    const { emailOrMobile, securityQuestion, securityAnswer } = req.body;
+    if (!emailOrMobile || !securityQuestion || !securityAnswer) {
+      return res.status(400).json({ error: 'Email/mobile, security question and answer are required' });
+    }
+
+    const buyer = await Buyer.findOne({
+      $or: [{ email: String(emailOrMobile).toLowerCase().trim() }, { mobile: String(emailOrMobile).trim() }],
+    });
+    if (!buyer) return res.status(404).json({ error: 'No account found with this email/mobile' });
+    if (!buyer.securityQuestion || !buyer.securityAnswer) {
+      return res.status(400).json({ error: 'Security question was not set for this account. Contact support.' });
+    }
+    if (buyer.securityQuestion !== securityQuestion) {
+      return res.status(401).json({ error: 'Security question does not match' });
+    }
+
+    const match = await bcrypt.compare(String(securityAnswer).trim().toLowerCase(), buyer.securityAnswer);
+    if (!match) return res.status(401).json({ error: 'Incorrect security answer' });
+
+    const resetToken = jwt.sign(
+      { id: buyer._id.toString(), type: 'buyer_reset' },
+      JWT_SECRET,
+      { expiresIn: '15m' }
+    );
+    res.json({ success: true, resetToken, message: 'Identity verified' });
+  } catch (err) {
+    console.error('Forgot password verify error:', err);
+    res.status(500).json({ error: 'Verification failed' });
+  }
+});
+
+// Buyer: reset password after verify
+app.post('/api/buyer/forgot-password/reset', async (req, res) => {
+  try {
+    const { resetToken, newPassword } = req.body;
+    if (!resetToken || !newPassword) {
+      return res.status(400).json({ error: 'resetToken and newPassword are required' });
+    }
+    if (String(newPassword).length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(resetToken, JWT_SECRET);
+    } catch (_) {
+      return res.status(401).json({ error: 'Reset link expired. Please verify again.' });
+    }
+    if (decoded.type !== 'buyer_reset') {
+      return res.status(401).json({ error: 'Invalid reset token' });
+    }
+
+    const buyer = await Buyer.findById(decoded.id);
+    if (!buyer) return res.status(404).json({ error: 'Account not found' });
+
+    buyer.password = await bcrypt.hash(String(newPassword), 10);
+    await buyer.save();
+    res.json({ success: true, message: 'Password updated. Please log in.' });
+  } catch (err) {
+    console.error('Forgot password reset error:', err);
+    res.status(500).json({ error: 'Could not reset password' });
   }
 });
 
@@ -1074,6 +1157,189 @@ app.delete('/api/buyer/addresses/:index', buyerAuthMiddleware, async (req, res) 
     res.json(buyer.addresses);
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete address' });
+  }
+});
+
+// ================= BUYER CART =================
+
+app.get('/api/buyer/cart', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const buyer = await Buyer.findById(req.buyerId).select('cart');
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+    res.json(buyer.cart || []);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load cart' });
+  }
+});
+
+// Replace entire cart (app syncs after local edits)
+app.put('/api/buyer/cart', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const items = Array.isArray(req.body.items) ? req.body.items : req.body;
+    if (!Array.isArray(items)) return res.status(400).json({ error: 'items must be an array' });
+
+    const buyer = await Buyer.findById(req.buyerId);
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+
+    buyer.cart = items.map((i) => ({
+      productId: String(i.productId || i.id || ''),
+      name: String(i.name || ''),
+      price: String(i.price || '0'),
+      originalPrice: String(i.originalPrice || i.price || '0'),
+      emoji: String(i.emoji || '🛍️'),
+      size: String(i.size || 'M'),
+      color: String(i.color || 'Default'),
+      imageUrl: String(i.imageUrl || ''),
+      quantity: Math.max(1, Number(i.quantity) || 1),
+    })).filter((i) => i.productId);
+
+    await buyer.save();
+    res.json(buyer.cart);
+  } catch (err) {
+    console.error('Save cart error:', err);
+    res.status(500).json({ error: 'Failed to save cart' });
+  }
+});
+
+// ================= BUYER WISHLIST =================
+
+app.get('/api/buyer/wishlist', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const buyer = await Buyer.findById(req.buyerId).select('wishlist');
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+    res.json(buyer.wishlist || []);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load wishlist' });
+  }
+});
+
+app.put('/api/buyer/wishlist', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body.productIds)
+      ? req.body.productIds
+      : (Array.isArray(req.body) ? req.body : null);
+    if (!ids) return res.status(400).json({ error: 'productIds must be an array' });
+
+    const buyer = await Buyer.findById(req.buyerId);
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+
+    buyer.wishlist = [...new Set(ids.map((id) => String(id)).filter(Boolean))];
+    await buyer.save();
+    res.json(buyer.wishlist);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to save wishlist' });
+  }
+});
+
+app.post('/api/buyer/wishlist/:productId', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const productId = String(req.params.productId);
+    const buyer = await Buyer.findById(req.buyerId);
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+    if (!buyer.wishlist.includes(productId)) buyer.wishlist.push(productId);
+    await buyer.save();
+    res.json(buyer.wishlist);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update wishlist' });
+  }
+});
+
+app.delete('/api/buyer/wishlist/:productId', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const productId = String(req.params.productId);
+    const buyer = await Buyer.findById(req.buyerId);
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+    buyer.wishlist = (buyer.wishlist || []).filter((id) => id !== productId);
+    await buyer.save();
+    res.json(buyer.wishlist);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update wishlist' });
+  }
+});
+
+// ================= BUYER NOTIFICATIONS =================
+
+app.get('/api/buyer/notifications', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const buyer = await Buyer.findById(req.buyerId).select('notifications');
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+    const list = (buyer.notifications || [])
+      .slice()
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .map((n) => ({
+        id: n._id.toString(),
+        title: n.title,
+        body: n.body,
+        type: n.type,
+        orderId: n.orderId || '',
+        isRead: Boolean(n.isRead),
+        createdAt: n.createdAt,
+        time: n.createdAt ? new Date(n.createdAt).toLocaleString() : 'Just now',
+      }));
+    res.json(list);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load notifications' });
+  }
+});
+
+app.post('/api/buyer/notifications', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const { title, body, type, orderId } = req.body;
+    if (!title) return res.status(400).json({ error: 'title is required' });
+    const buyer = await Buyer.findById(req.buyerId);
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+
+    buyer.notifications.unshift({
+      title,
+      body: body || '',
+      type: type || 'general',
+      orderId: orderId || '',
+      isRead: false,
+      createdAt: new Date(),
+    });
+    // Keep last 100
+    if (buyer.notifications.length > 100) buyer.notifications = buyer.notifications.slice(0, 100);
+    await buyer.save();
+
+    const n = buyer.notifications[0];
+    res.json({
+      id: n._id.toString(),
+      title: n.title,
+      body: n.body,
+      type: n.type,
+      orderId: n.orderId || '',
+      isRead: false,
+      createdAt: n.createdAt,
+      time: 'Just now',
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create notification' });
+  }
+});
+
+app.put('/api/buyer/notifications/read-all', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const buyer = await Buyer.findById(req.buyerId);
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+    buyer.notifications.forEach((n) => { n.isRead = true; });
+    await buyer.save();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to mark notifications read' });
+  }
+});
+
+app.put('/api/buyer/notifications/:id/read', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const buyer = await Buyer.findById(req.buyerId);
+    if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
+    const n = buyer.notifications.id(req.params.id);
+    if (!n) return res.status(404).json({ error: 'Notification not found' });
+    n.isRead = true;
+    await buyer.save();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update notification' });
   }
 });
 
@@ -1775,6 +2041,30 @@ app.post('/api/checkout/cart', async (req, res) => {
       paymentStatus: 'pending',
     });
 
+    if (buyerId) {
+      try {
+        await Buyer.findByIdAndUpdate(buyerId, {
+          $push: {
+            notifications: {
+              $each: [{
+                title: 'Order Placed Successfully!',
+                body: `Your order #${order._id.toString()} has been placed. We'll notify you when it ships.`,
+                type: 'order',
+                orderId: order._id.toString(),
+                isRead: false,
+                createdAt: new Date(),
+              }],
+              $position: 0,
+              $slice: 100,
+            },
+          },
+          $set: { cart: [] },
+        });
+      } catch (notifErr) {
+        console.error('Post-checkout buyer update failed:', notifErr);
+      }
+    }
+
     res.json({
       success: true,
       orderId: order._id.toString(),
@@ -1916,6 +2206,65 @@ app.get('/api/invoice/:orderId', async (req, res) => {
 
 // ================= ORDERS =================
 
+/** Push an in-app notification to the buyer when supplier updates order status from web. */
+async function notifyBuyerOrderStatus(order, newStatus) {
+  if (!order || !order.buyerId) return;
+
+  const orderId = order._id.toString();
+  const productHint = (order.items && order.items[0] && order.items[0].title)
+    ? order.items[0].title
+    : 'your order';
+
+  let title = 'Order update';
+  let body = `Order #${orderId} is now ${newStatus}.`;
+
+  switch (newStatus) {
+    case 'packed':
+      title = 'Order Packed';
+      body = `Your order #${orderId} (${productHint}) has been packed and will ship soon.`;
+      break;
+    case 'shipped':
+      title = 'Order Shipped';
+      body = `Your order #${orderId} (${productHint}) is on the way. Tap to track.`;
+      break;
+    case 'delivered':
+      title = 'Order Delivered';
+      body = `Your order #${orderId} has been marked delivered. Enjoy!`;
+      break;
+    case 'cancelled':
+      title = 'Order Cancelled';
+      body = `Your order #${orderId} was cancelled.`;
+      break;
+    case 'returned':
+      title = 'Order Returned';
+      body = `Your return for order #${orderId} is complete.`;
+      break;
+    default:
+      return; // skip pending / unknown
+  }
+
+  try {
+    await Buyer.findByIdAndUpdate(order.buyerId, {
+      $push: {
+        notifications: {
+          $each: [{
+            title,
+            body,
+            type: 'order',
+            orderId,
+            isRead: false,
+            createdAt: new Date(),
+          }],
+          $position: 0,
+          $slice: 100,
+        },
+      },
+    });
+  } catch (err) {
+    console.error('notifyBuyerOrderStatus failed:', err);
+  }
+}
+
 function safeOrder(orderDoc) {
   const o = orderDoc.toObject ? orderDoc.toObject() : orderDoc;
   const { __v, _id, supplierId, ...rest } = o;
@@ -2029,8 +2378,15 @@ app.put('/api/orders/:id/status', authMiddleware, async (req, res) => {
     const allowed = ['pending', 'packed', 'shipped', 'delivered', 'cancelled', 'returned'];
     if (!allowed.includes(req.body.status)) return res.status(400).json({ error: 'Invalid status' });
 
+    const prevStatus = order.status;
     order.status = req.body.status;
     await order.save();
+
+    // Notify buyer in app when status actually changes (packed / shipped / etc.)
+    if (prevStatus !== order.status) {
+      await notifyBuyerOrderStatus(order, order.status);
+    }
+
     res.json(safeOrder(order));
   } catch (err) {
     console.error('Update order status error:', err);
