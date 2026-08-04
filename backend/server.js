@@ -72,7 +72,7 @@ const uploadReviewMedia = multer({ storage: cloudinaryStorage, limits: { fileSiz
 // Excel product bulk import — keep file in memory (not Cloudinary)
 const uploadExcel = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB — pricelists can be large
   fileFilter: (req, file, cb) => {
     const name = (file.originalname || '').toLowerCase();
     const ok =
@@ -715,6 +715,9 @@ app.get('/api/products/excel-template', authMiddleware, (req, res) => {
 app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
   uploadExcel.single('file')(req, res, async (err) => {
     if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({ error: 'File too large. Max Excel size is 50MB.' });
+      }
       return res.status(400).json({ error: err.message || 'Invalid Excel file' });
     }
     try {
@@ -747,7 +750,7 @@ app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
 
       const created = [];
       const errors = [];
-      const MAX_ROWS = 200;
+      const MAX_ROWS = 2000;
 
       for (let i = 0; i < rows.length; i++) {
         const rowNum = i + 2; // header is row 1
