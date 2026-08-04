@@ -347,6 +347,299 @@ function buildExcelImageMap(imageFiles) {
   return map;
 }
 
+// ── Bulk Excel async jobs (avoids Render/proxy timeouts on 1000+ rows) ──
+const bulkExcelJobs = new Map();
+
+function createBulkExcelJob(supplierId) {
+  const id = crypto.randomUUID();
+  const job = {
+    id,
+    supplierId: String(supplierId),
+    status: 'queued', // queued | processing | done | error
+    phase: 'queued',
+    message: 'Upload received. Starting…',
+    progress: 0,
+    total: 0,
+    processed: 0,
+    createdCount: 0,
+    errorCount: 0,
+    created: [],
+    errors: [],
+    updatedAt: Date.now(),
+  };
+  bulkExcelJobs.set(id, job);
+  // Auto-cleanup after 2 hours
+  setTimeout(() => bulkExcelJobs.delete(id), 2 * 60 * 60 * 1000);
+  return job;
+}
+
+function updateBulkJob(job, patch) {
+  Object.assign(job, patch, { updatedAt: Date.now() });
+}
+
+async function mapPool(items, concurrency, workerFn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const idx = next++;
+      results[idx] = await workerFn(items[idx], idx);
+    }
+  }
+  const n = Math.max(1, Math.min(concurrency, items.length || 1));
+  await Promise.all(Array.from({ length: n }, () => worker()));
+  return results;
+}
+
+async function processBulkExcelJob(job, { excelBuffer, imageFiles, catalogIds }) {
+  updateBulkJob(job, { status: 'processing', phase: 'parsing', message: 'Reading Excel…', progress: 2 });
+
+  const workbook = XLSX.read(excelBuffer, { type: 'buffer', cellDates: false });
+  const sheetName = workbook.SheetNames.find((n) => {
+    const low = String(n).toLowerCase();
+    return low !== 'image instructions' && low !== 'instructions';
+  }) || workbook.SheetNames[0];
+  if (!sheetName) {
+    updateBulkJob(job, { status: 'error', message: 'Excel file has no sheets', progress: 100 });
+    return;
+  }
+  const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: '', raw: false });
+  if (!rows.length) {
+    updateBulkJob(job, { status: 'error', message: 'Excel sheet is empty', progress: 100 });
+    return;
+  }
+
+  const MAX_ROWS = 2000;
+  const total = Math.min(rows.length, MAX_ROWS);
+  updateBulkJob(job, {
+    total,
+    phase: 'images',
+    message: `Found ${total} rows. Extracting pictures…`,
+    progress: 5,
+  });
+
+  const imageMap = buildExcelImageMap(imageFiles);
+  const embeddedByRow = await extractEmbeddedImagesByRow(excelBuffer);
+  const sequentialImages = embeddedByRow.get('__sequential__') || [];
+  embeddedByRow.delete('__sequential__');
+
+  // Pre-build validated row payloads (no DB / Cloudinary yet)
+  const pending = [];
+  const errors = [];
+  for (let i = 0; i < rows.length; i++) {
+    const rowNum = i + 2;
+    if (i >= MAX_ROWS) {
+      errors.push({ row: rowNum, error: `Skipped — max ${MAX_ROWS} products per upload` });
+      continue;
+    }
+    const mapped = mapExcelRow(rows[i]);
+    const title = cellStr(mapped.title);
+    const priceRaw = mapped.price;
+    if (!title || priceRaw === undefined || priceRaw === null || cellStr(priceRaw) === '') {
+      errors.push({ row: rowNum, error: 'title and price are required' });
+      continue;
+    }
+    const price = Number(priceRaw);
+    if (Number.isNaN(price) || price < 0) {
+      errors.push({ row: rowNum, title, error: 'price must be a valid number' });
+      continue;
+    }
+    const mrpRaw = mapped.mrp;
+    const mrp = mrpRaw !== undefined && cellStr(mrpRaw) !== '' ? Number(mrpRaw) : price;
+    if (Number.isNaN(mrp) || mrp < 0) {
+      errors.push({ row: rowNum, title, error: 'mrp must be a valid number' });
+      continue;
+    }
+    const sizeStock = buildSizeStockFromExcelRow(mapped);
+    const finalSizeStock = sizeStock.length > 0 ? sizeStock : [{ size: 'M', stock: 0 }];
+    const stock = finalSizeStock.reduce((sum, s) => sum + Number(s.stock || 0), 0);
+    const styleCode = cellStr(mapped.stylecode);
+    const color = cellStr(mapped.color)
+      ? cellStr(mapped.color).split(',').map((c) => c.trim()).filter(Boolean)
+      : [];
+
+    pending.push({
+      rowNum,
+      title,
+      price,
+      mrp,
+      styleCode,
+      color,
+      mapped,
+      finalSizeStock,
+      stock,
+      urlCandidates: [mapped.imageurl1, mapped.imageurl2, mapped.imageurl3, mapped.imageurl4],
+    });
+  }
+
+  updateBulkJob(job, {
+    phase: 'images',
+    message: `Uploading images for ${pending.length} products…`,
+    progress: 10,
+    errorCount: errors.length,
+    errors: errors.slice(0, 100),
+  });
+
+  // Resolve images in parallel (biggest speed win)
+  const IMAGE_CONCURRENCY = 8;
+  let imagesDone = 0;
+  await mapPool(pending, IMAGE_CONCURRENCY, async (row) => {
+    try {
+      row.imageUrls = await resolveImageUrlsFromSources({
+        urlCandidates: row.urlCandidates,
+        styleCode: row.styleCode,
+        rowNum: row.rowNum,
+        imageMap,
+        embeddedByRow,
+        sequentialImages,
+      });
+    } catch (e) {
+      row.imageUrls = [];
+    }
+    imagesDone += 1;
+    if (imagesDone % 10 === 0 || imagesDone === pending.length) {
+      const pct = 10 + Math.round((imagesDone / Math.max(pending.length, 1)) * 55);
+      updateBulkJob(job, {
+        processed: imagesDone,
+        progress: Math.min(pct, 65),
+        message: `Uploading images… ${imagesDone}/${pending.length}`,
+      });
+    }
+  });
+
+  updateBulkJob(job, {
+    phase: 'saving',
+    message: 'Saving products…',
+    progress: 70,
+  });
+
+  // insertMany in batches
+  const created = [];
+  const BATCH = 100;
+  for (let start = 0; start < pending.length; start += BATCH) {
+    const slice = pending.slice(start, start + BATCH);
+    const docs = slice.map((row) => ({
+      supplierId: job.supplierId,
+      category: 'T-Shirt',
+      gst: cellStr(row.mapped.gst),
+      hsnCode: cellStr(row.mapped.hsncode),
+      netWeight: cellStr(row.mapped.netweight),
+      styleCode: row.styleCode,
+      title: row.title,
+      price: row.price,
+      mrp: row.mrp,
+      color: row.color,
+      fabric: cellStr(row.mapped.fabric),
+      fitShape: cellStr(row.mapped.fitshape),
+      genericName: cellStr(row.mapped.genericname),
+      netQuantity: cellStr(row.mapped.netquantity) || '1',
+      neck: cellStr(row.mapped.neck),
+      occasion: cellStr(row.mapped.occasion),
+      pattern: cellStr(row.mapped.pattern),
+      printOrPatternType: cellStr(row.mapped.printorpatterntype),
+      sleeveLength: cellStr(row.mapped.sleevelength),
+      countryOfOrigin: cellStr(row.mapped.countryoforigin) || 'India',
+      manufacturerName: cellStr(row.mapped.manufacturername),
+      manufacturerAddress: cellStr(row.mapped.manufactureraddress),
+      manufacturerPincode: cellStr(row.mapped.manufacturerpincode),
+      packerName: cellStr(row.mapped.packername),
+      packerAddress: cellStr(row.mapped.packeraddress),
+      packerPincode: cellStr(row.mapped.packerpincode),
+      importerName: cellStr(row.mapped.importername),
+      importerAddress: cellStr(row.mapped.importeraddress),
+      importerPincode: cellStr(row.mapped.importerpincode),
+      brand: cellStr(row.mapped.brand),
+      character: cellStr(row.mapped.character),
+      hemline: cellStr(row.mapped.hemline),
+      length: cellStr(row.mapped.length),
+      numberOfPockets: cellStr(row.mapped.numberofpockets),
+      sleeveStyling: cellStr(row.mapped.sleevestyling),
+      style: cellStr(row.mapped.style),
+      description: cellStr(row.mapped.description),
+      sizeStock: row.finalSizeStock,
+      stock: row.stock,
+      imageUrls: row.imageUrls || [],
+      imageUrl: (row.imageUrls && row.imageUrls[0]) || null,
+      status: 'live',
+      catalogIds,
+    }));
+
+    try {
+      const inserted = await Product.insertMany(docs, { ordered: false });
+      inserted.forEach((p) => {
+        created.push({
+          id: p._id.toString(),
+          title: p.title,
+          price: p.price,
+          imageUrl: p.imageUrl || null,
+          imageUrls: p.imageUrls || [],
+        });
+      });
+    } catch (batchErr) {
+      // Partial success possible with ordered:false
+      if (batchErr.insertedDocs && batchErr.insertedDocs.length) {
+        batchErr.insertedDocs.forEach((p) => {
+          created.push({
+            id: p._id.toString(),
+            title: p.title,
+            price: p.price,
+            imageUrl: p.imageUrl || null,
+            imageUrls: p.imageUrls || [],
+          });
+        });
+      }
+      const writeErrors = (batchErr.writeErrors || []).map((we) => ({
+        row: slice[we.index] ? slice[we.index].rowNum : '?',
+        title: slice[we.index] ? slice[we.index].title : '',
+        error: we.errmsg || we.message || 'Insert failed',
+      }));
+      if (writeErrors.length) errors.push(...writeErrors);
+      else if (!batchErr.insertedDocs || !batchErr.insertedDocs.length) {
+        // Fallback: try one-by-one for this batch
+        for (let j = 0; j < slice.length; j++) {
+          const row = slice[j];
+          try {
+            const p = await Product.create(docs[j]);
+            created.push({
+              id: p._id.toString(),
+              title: p.title,
+              price: p.price,
+              imageUrl: p.imageUrl || null,
+              imageUrls: p.imageUrls || [],
+            });
+          } catch (oneErr) {
+            errors.push({ row: row.rowNum, title: row.title, error: oneErr.message || 'Failed to create' });
+          }
+        }
+      }
+    }
+
+    const saved = Math.min(start + slice.length, pending.length);
+    const pct = 70 + Math.round((saved / Math.max(pending.length, 1)) * 28);
+    updateBulkJob(job, {
+      createdCount: created.length,
+      errorCount: errors.length,
+      processed: saved,
+      progress: Math.min(pct, 98),
+      message: `Saving products… ${saved}/${pending.length}`,
+      created: created.slice(0, 80),
+      errors: errors.slice(0, 100),
+    });
+  }
+
+  updateBulkJob(job, {
+    status: 'done',
+    phase: 'done',
+    progress: 100,
+    createdCount: created.length,
+    errorCount: errors.length,
+    created: created.slice(0, 100),
+    errors: errors.slice(0, 150),
+    message: `Done — created ${created.length} product(s)`
+      + (errors.length ? `, ${errors.length} row(s) failed` : ''),
+  });
+}
+
 const EXCEL_HEADER_ALIASES = {
   title: ['title', 'productname', 'name', 'producttitle'],
   price: ['price', 'sellingprice', 'sp'],
@@ -956,7 +1249,7 @@ app.get('/api/products/excel-template', authMiddleware, (req, res) => {
   }
 });
 
-// Supplier: bulk create products from Excel / CSV (+ optional product images)
+// Supplier: bulk create products from Excel / CSV (async job — no request timeout)
 app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
   uploadExcel.fields([
     { name: 'file', maxCount: 1 },
@@ -994,147 +1287,65 @@ app.post('/api/products/bulk-excel', authMiddleware, (req, res) => {
         return res.status(400).json({ error: 'At least one catalog is required' });
       }
 
-      const workbook = XLSX.read(excelFile.buffer, { type: 'buffer', cellDates: false });
-      const sheetName = workbook.SheetNames.find((n) => {
-        const low = String(n).toLowerCase();
-        return low !== 'image instructions' && low !== 'instructions';
-      }) || workbook.SheetNames[0];
-      if (!sheetName) return res.status(400).json({ error: 'Excel file has no sheets' });
-      const sheet = workbook.Sheets[sheetName];
-      const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
-      if (!rows.length) return res.status(400).json({ error: 'Excel sheet is empty' });
+      const job = createBulkExcelJob(req.supplierId);
+      // Copy buffers before responding (multer memory is fine to keep referenced)
+      const excelBuffer = excelFile.buffer;
+      const imageFilesCopy = (imageFiles || []).map((f) => ({
+        buffer: f.buffer,
+        originalname: f.originalname,
+      }));
 
-      const imageMap = buildExcelImageMap(imageFiles);
-      const embeddedByRow = await extractEmbeddedImagesByRow(excelFile.buffer);
-      const sequentialImages = embeddedByRow.get('__sequential__') || [];
-      embeddedByRow.delete('__sequential__');
-      const created = [];
-      const errors = [];
-      const MAX_ROWS = 2000;
-
-      for (let i = 0; i < rows.length; i++) {
-        const rowNum = i + 2; // header is row 1
-        if (i >= MAX_ROWS) {
-          errors.push({ row: rowNum, error: `Skipped — max ${MAX_ROWS} products per upload` });
-          continue;
-        }
-
-        const mapped = mapExcelRow(rows[i]);
-        const title = cellStr(mapped.title);
-        const priceRaw = mapped.price;
-        if (!title || priceRaw === undefined || priceRaw === null || cellStr(priceRaw) === '') {
-          errors.push({ row: rowNum, error: 'title and price are required' });
-          continue;
-        }
-        const price = Number(priceRaw);
-        if (Number.isNaN(price) || price < 0) {
-          errors.push({ row: rowNum, title, error: 'price must be a valid number' });
-          continue;
-        }
-
-        const mrpRaw = mapped.mrp;
-        const mrp = mrpRaw !== undefined && cellStr(mrpRaw) !== '' ? Number(mrpRaw) : price;
-        if (Number.isNaN(mrp) || mrp < 0) {
-          errors.push({ row: rowNum, title, error: 'mrp must be a valid number' });
-          continue;
-        }
-
-        const sizeStock = buildSizeStockFromExcelRow(mapped);
-        const finalSizeStock = sizeStock.length > 0 ? sizeStock : [{ size: 'M', stock: 0 }];
-        const stock = finalSizeStock.reduce((sum, s) => sum + Number(s.stock || 0), 0);
-        const styleCode = cellStr(mapped.stylecode);
-
-        let imageUrls = [];
-        try {
-          imageUrls = await resolveImageUrlsFromSources({
-            urlCandidates: [mapped.imageurl1, mapped.imageurl2, mapped.imageurl3, mapped.imageurl4],
-            styleCode,
-            rowNum,
-            imageMap,
-            embeddedByRow,
-            sequentialImages,
-          });
-        } catch (imgErr) {
-          console.error('Image resolve error:', imgErr);
-        }
-
-        const color = cellStr(mapped.color)
-          ? cellStr(mapped.color).split(',').map((c) => c.trim()).filter(Boolean)
-          : [];
-
-        try {
-          const product = await Product.create({
-            supplierId: req.supplierId,
-            category: 'T-Shirt',
-            gst: cellStr(mapped.gst),
-            hsnCode: cellStr(mapped.hsncode),
-            netWeight: cellStr(mapped.netweight),
-            styleCode,
-            title,
-            price,
-            mrp,
-            color,
-            fabric: cellStr(mapped.fabric),
-            fitShape: cellStr(mapped.fitshape),
-            genericName: cellStr(mapped.genericname),
-            netQuantity: cellStr(mapped.netquantity) || '1',
-            neck: cellStr(mapped.neck),
-            occasion: cellStr(mapped.occasion),
-            pattern: cellStr(mapped.pattern),
-            printOrPatternType: cellStr(mapped.printorpatterntype),
-            sleeveLength: cellStr(mapped.sleevelength),
-            countryOfOrigin: cellStr(mapped.countryoforigin) || 'India',
-            manufacturerName: cellStr(mapped.manufacturername),
-            manufacturerAddress: cellStr(mapped.manufactureraddress),
-            manufacturerPincode: cellStr(mapped.manufacturerpincode),
-            packerName: cellStr(mapped.packername),
-            packerAddress: cellStr(mapped.packeraddress),
-            packerPincode: cellStr(mapped.packerpincode),
-            importerName: cellStr(mapped.importername),
-            importerAddress: cellStr(mapped.importeraddress),
-            importerPincode: cellStr(mapped.importerpincode),
-            brand: cellStr(mapped.brand),
-            character: cellStr(mapped.character),
-            hemline: cellStr(mapped.hemline),
-            length: cellStr(mapped.length),
-            numberOfPockets: cellStr(mapped.numberofpockets),
-            sleeveStyling: cellStr(mapped.sleevestyling),
-            style: cellStr(mapped.style),
-            description: cellStr(mapped.description),
-            sizeStock: finalSizeStock,
-            stock,
-            imageUrls,
-            imageUrl: imageUrls.length > 0 ? imageUrls[0] : null,
-            status: 'live',
-            catalogIds,
-          });
-          created.push({
-            id: product._id.toString(),
-            title: product.title,
-            price: product.price,
-            imageUrl: product.imageUrl || null,
-            imageUrls: product.imageUrls || [],
-          });
-        } catch (createErr) {
-          console.error('Bulk excel row create error:', createErr);
-          errors.push({ row: rowNum, title, error: createErr.message || 'Failed to create product' });
-        }
-      }
-
-      res.json({
+      // Respond immediately so proxies / browsers do not time out
+      res.status(202).json({
         success: true,
-        totalRows: rows.length,
-        createdCount: created.length,
-        errorCount: errors.length,
-        imagesReceived: imageFiles.length,
-        embeddedImagesFound: embeddedByRow.size,
-        created,
-        errors,
+        async: true,
+        jobId: job.id,
+        message: 'Upload accepted. Processing in background…',
+        statusUrl: `/api/products/bulk-excel/status/${job.id}`,
+      });
+
+      setImmediate(() => {
+        processBulkExcelJob(job, {
+          excelBuffer,
+          imageFiles: imageFilesCopy,
+          catalogIds,
+        }).catch((e) => {
+          console.error('Bulk excel job crashed:', e);
+          updateBulkJob(job, {
+            status: 'error',
+            phase: 'error',
+            progress: 100,
+            message: e.message || 'Bulk import failed',
+          });
+        });
       });
     } catch (e) {
       console.error('Bulk excel upload error:', e);
       res.status(500).json({ error: 'Failed to import products from Excel' });
     }
+  });
+});
+
+// Poll bulk excel job progress
+app.get('/api/products/bulk-excel/status/:jobId', authMiddleware, (req, res) => {
+  const job = bulkExcelJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found or expired' });
+  if (String(job.supplierId) !== String(req.supplierId)) {
+    return res.status(403).json({ error: 'Not allowed' });
+  }
+  res.json({
+    jobId: job.id,
+    status: job.status,
+    phase: job.phase,
+    message: job.message,
+    progress: job.progress,
+    total: job.total,
+    processed: job.processed,
+    createdCount: job.createdCount,
+    errorCount: job.errorCount,
+    created: job.created,
+    errors: job.errors,
+    success: job.status === 'done',
   });
 });
 
