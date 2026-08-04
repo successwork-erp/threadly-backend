@@ -927,6 +927,34 @@ app.get('/api/buyer/orders', buyerAuthMiddleware, async (req, res) => {
   }
 });
 
+// Buyer: confirm product received (shipped → delivered only)
+app.put('/api/buyer/orders/:id/confirm-delivery', buyerAuthMiddleware, async (req, res) => {
+  try {
+    const order = await Order.findOne({ _id: req.params.id, buyerId: req.buyerId });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.status !== 'shipped') {
+      return res.status(400).json({
+        error: 'Only shipped orders can be confirmed as delivered',
+        status: order.status,
+      });
+    }
+
+    order.status = 'delivered';
+    if (order.paymentStatus !== 'paid') {
+      order.paymentStatus = 'paid';
+      order.paidAt = order.paidAt || new Date();
+    }
+    await order.save();
+
+    const obj = order.toObject();
+    const { __v, _id, supplierId, buyerId, ...rest } = obj;
+    res.json({ ...rest, id: _id.toString(), message: 'Delivery confirmed' });
+  } catch (err) {
+    console.error('Confirm delivery error:', err);
+    res.status(500).json({ error: 'Failed to confirm delivery' });
+  }
+});
+
 // Buyer: manage saved delivery addresses
 app.get('/api/buyer/addresses', buyerAuthMiddleware, async (req, res) => {
   try {
